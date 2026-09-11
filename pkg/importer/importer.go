@@ -1,0 +1,543 @@
+package importer
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ellypaws/unpackage/pkg/store"
+)
+
+type file struct {
+	name, channel string
+	size          int64
+	category      int
+}
+
+func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan struct{}, logger *slog.Logger) (ret error) {
+	snapshot := store.Snapshot{Slot: slot, Path: p, State: "loading", Phase: "discovering"}
+	s.SetSnapshot(slot, snapshot)
+	logger.Info("Import started", "slot", slot)
+	var processed atomic.Int64
+	var issues atomic.Int64
+	var lastPublish atomic.Int64
+	var publishMu sync.Mutex
+	publish := func(phase string, force bool) {
+		now := time.Now().UnixNano()
+		if !force {
+			last := lastPublish.Load()
+			if now-last < int64(150*time.Millisecond) || !lastPublish.CompareAndSwap(last, now) {
+				return
+			}
+		} else {
+			lastPublish.Store(now)
+		}
+		publishMu.Lock()
+		defer publishMu.Unlock()
+		snapshot.Phase = phase
+		snapshot.Bytes = processed.Load()
+		snapshot.Errors = int(issues.Load())
+		s.SetSnapshot(slot, snapshot)
+	}
+	defer func() {
+		state := "ready"
+		if ret != nil {
+			state = "partial"
+		}
+		if errors.Is(ret, context.Canceled) {
+			state = "stopped"
+		}
+		if state == "partial" {
+			snapshot.Errors = max(int(issues.Load()), 1)
+			logger.Warn("Package could not be fully imported", "slot", slot)
+		}
+		snapshot.State = state
+		snapshot.Bytes = processed.Load()
+		s.SetSnapshot(slot, snapshot)
+		logger.Info("Import finished", "slot", slot, "state", state)
+	}()
+	st, e := os.Stat(p)
+	if e != nil {
+		return fmt.Errorf("cannot open package")
+	}
+	var source fs.FS
+	var closeSource func() error
+	if st.IsDir() {
+		root, e := os.OpenRoot(p)
+		if e != nil {
+			return fmt.Errorf("cannot open package directory")
+		}
+		source = root.FS()
+		closeSource = root.Close
+	} else {
+		z, e := zip.OpenReader(p)
+		if e != nil {
+			return fmt.Errorf("cannot open package ZIP")
+		}
+		defer z.Close()
+		seen := map[string]bool{}
+		for _, f := range z.File {
+			n := strings.TrimSuffix(f.Name, "/")
+			if !fs.ValidPath(n) || strings.Contains(n, "\\") {
+				return fmt.Errorf("unsafe ZIP entry")
+			}
+			low := strings.ToLower(n)
+			if seen[low] {
+				return fmt.Errorf("duplicate ZIP entry")
+			}
+			seen[low] = true
+		}
+		source = z
+		closeSource = func() error { return nil }
+	}
+	defer closeSource()
+	var files []file
+	var total int64
+	roots := map[string]bool{}
+	e = fs.WalkDir(source, ".", func(p string, d fs.DirEntry, e error) error {
+		if e != nil {
+			return fmt.Errorf("package enumeration failed")
+		}
+		if e = ctx.Err(); e != nil {
+			return e
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("symlink entries are unsupported")
+		}
+		if d.IsDir() {
+			return nil
+		}
+		lower := strings.ToLower(p)
+		parts := strings.Split(lower, "/")
+		cat := -1
+		cid := ""
+		for i, part := range parts {
+			if part == "messages" {
+				roots[strings.Join(parts[:i], "/")] = true
+				if i+1 == len(parts)-1 && parts[i+1] == "index.json" {
+					cat = 1
+				}
+				if i+2 == len(parts)-1 {
+					cid = strings.TrimPrefix(parts[i+1], "c")
+					if digits(cid) {
+						switch parts[i+2] {
+						case "channel.json":
+							cat = 2
+						case "messages.json", "messages.csv":
+							cat = 3
+						}
+					}
+				}
+			}
+			if part == "account" && i+1 == len(parts)-1 && parts[i+1] == "user.json" {
+				cat = 0
+			}
+			if part == "activity" && strings.HasSuffix(lower, ".json") {
+				cat = 4
+			}
+		}
+		if cat < 0 {
+			return nil
+		}
+		inf, e := d.Info()
+		if e != nil {
+			return e
+		}
+		files = append(files, file{p, cid, inf.Size(), cat})
+		total += inf.Size()
+		return nil
+	})
+	if e != nil {
+		return e
+	}
+	if len(roots) != 1 {
+		return fmt.Errorf("expected exactly one package Messages directory")
+	}
+	slices.SortFunc(files, func(a, b file) int {
+		if a.category != b.category {
+			return a.category - b.category
+		}
+		return strings.Compare(a.name, b.name)
+	})
+	snapshot.Total = total
+	publish("discovering", true)
+	accountFiles := 0
+	for _, f := range files {
+		if f.category == 0 {
+			accountFiles++
+		}
+	}
+	if accountFiles > 1 {
+		return fmt.Errorf("multiple account identity files; choose one package root")
+	}
+	jsonDirs := map[string]bool{}
+	for _, f := range files {
+		if f.category == 3 && strings.HasSuffix(strings.ToLower(f.name), ".json") {
+			jsonDirs[path.Dir(f.name)] = true
+		}
+	}
+	var stages [5][]file
+	for _, f := range files {
+		if f.category == 3 && strings.HasSuffix(strings.ToLower(f.name), ".csv") && jsonDirs[path.Dir(f.name)] {
+			processed.Add(f.size)
+			continue
+		}
+		stages[f.category] = append(stages[f.category], f)
+	}
+	processFile := func(f file, phase string) error {
+		r, e := source.Open(f.name)
+		if e != nil {
+			return e
+		}
+		g := &guarded{ctx: ctx, r: r, csv: strings.HasSuffix(strings.ToLower(f.name), ".csv")}
+		var messages []store.Message
+		messageBytes := 0
+		var metadata []store.ChannelObservation
+		observations := map[string]string{}
+		reported := int64(0)
+		lastProgress := time.Now()
+		flushMessages := func() error {
+			if len(messages) == 0 {
+				return nil
+			}
+			e := s.Add(ctx, slot, messages)
+			if e == nil {
+				messages = messages[:0]
+				messageBytes = 0
+			}
+			return e
+		}
+		flushMetadata := func() error {
+			if len(metadata) == 0 {
+				return nil
+			}
+			e := s.Channels(ctx, slot, metadata)
+			if e == nil {
+				metadata = metadata[:0]
+			}
+			return e
+		}
+		progress := func() error {
+			if time.Since(lastProgress) < 150*time.Millisecond {
+				return ctx.Err()
+			}
+			delta := g.bytes - reported
+			if delta > 0 {
+				processed.Add(delta)
+				reported = g.bytes
+			}
+			if e := flushMessages(); e != nil {
+				return e
+			}
+			if e := flushMetadata(); e != nil {
+				return e
+			}
+			publish(phase, false)
+			lastProgress = time.Now()
+			return ctx.Err()
+		}
+		record := func(m map[string]string) error {
+			if e := ctx.Err(); e != nil {
+				return e
+			}
+			if e := progress(); e != nil {
+				return e
+			}
+			switch f.category {
+			case 0:
+				if digits(m["id"]) {
+					publishMu.Lock()
+					snapshot.Owner = m["id"]
+					publishMu.Unlock()
+					publish(phase, true)
+					return nil
+				}
+			case 2:
+				if m["id"] == f.channel {
+					gid := m["guild_id"]
+					if gid == "" && digits(m["guild"]) {
+						gid = m["guild"]
+					}
+					kind := "unknown"
+					if gid != "" {
+						kind = "guild"
+					}
+					if m["type"] == "DM" || m["type"] == "GROUP_DM" || m["type"] == "1" || m["type"] == "3" {
+						kind = "dm"
+					}
+					metadata = append(metadata, store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Rank: 3})
+				}
+			case 3:
+				id := m["id"]
+				if id == "" {
+					return fmt.Errorf("message record has no ID")
+				}
+				if !digits(id) {
+					return fmt.Errorf("invalid message ID")
+				}
+				body := m["contents"]
+				if body == "" {
+					body = m["content"]
+				}
+				hasAttachments := m["has_attachments"] == "1" || attachmentPresent(m["attachments"])
+				hasMedia := m["has_media"] == "1" || attachmentMedia(m["attachments"])
+				messages = append(messages, store.Message{ID: id, Channel: f.channel, Date: store.Day(id), Content: body, HasAttachments: hasAttachments, HasMedia: hasMedia})
+				messageBytes += len(body)
+				if len(messages) >= 256 || messageBytes >= 2<<20 {
+					return flushMessages()
+				}
+			case 4:
+				if digits(m["channel_id"]) && digits(m["guild_id"]) {
+					key := m["channel_id"]
+					value := m["guild_id"] + "\x00" + m["guild_name"] + "\x00" + m["channel_name"]
+					if observations[key] == value {
+						return nil
+					}
+					if len(observations) >= 16384 {
+						clear(observations)
+					}
+					observations[key] = value
+					metadata = append(metadata, store.ChannelObservation{ID: m["channel_id"], Name: m["channel_name"], Guild: m["guild_id"], Server: m["guild_name"], Kind: "guild", Rank: 2})
+					if len(metadata) >= 512 {
+						return flushMetadata()
+					}
+				}
+			}
+			return nil
+		}
+		field := func(k, v string) error {
+			if f.category == 1 && digits(k) {
+				name, guild, kind := label(v)
+				metadata = append(metadata, store.ChannelObservation{ID: k, Name: name, Server: guild, Kind: kind, Rank: 1})
+				if len(metadata) >= 512 {
+					return flushMetadata()
+				}
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(f.name), ".csv") {
+			e = readCSV(g, record)
+		} else if f.category == 3 {
+			e = readMessages(g, record)
+		} else if f.category == 0 || f.category == 2 {
+			d := json.NewDecoder(g)
+			d.UseNumber()
+			var root map[string]string
+			root, e = walk(d, 0, nil, nil)
+			if e == nil {
+				e = record(root)
+			}
+			if e == nil {
+				_, e = d.Token()
+				if e == io.EOF {
+					e = nil
+				} else if e == nil {
+					e = fmt.Errorf("trailing JSON data")
+				}
+			}
+			if e != nil && f.category == 0 {
+				snapshot.Owner = ""
+				s.SetSnapshot(slot, snapshot)
+			}
+		} else if f.category == 4 {
+			d := json.NewDecoder(g)
+			d.UseNumber()
+			for {
+				_, e = walk(d, 0, record, field)
+				if e == io.EOF {
+					e = nil
+					break
+				}
+				if e != nil {
+					break
+				}
+			}
+		} else {
+			e = stream(g, record, field)
+		}
+		e = errors.Join(e, flushMessages(), flushMetadata(), r.Close())
+		if delta := g.bytes - reported; delta > 0 {
+			processed.Add(delta)
+		}
+		publish(phase, false)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return e
+	}
+	runStage := func(category int) (int, error) {
+		phase := []string{"account", "index", "channels", "messages", "activity"}[category]
+		publish(phase, true)
+		results := parallelFiles(ctx, limiter, stages[category], func(f file) error { return processFile(f, phase) })
+		if e := ctx.Err(); e != nil {
+			return 0, e
+		}
+		failed := 0
+		for _, result := range results {
+			if result == nil {
+				continue
+			}
+			failed++
+			issues.Add(1)
+			logger.Warn("Import file incomplete", "slot", slot, "phase", phase)
+		}
+		publish(phase, true)
+		return failed, nil
+	}
+	for category := range 3 {
+		failed, e := runStage(category)
+		if e != nil {
+			return e
+		}
+		if category == 0 && failed > 0 {
+			snapshot.Owner = ""
+		}
+	}
+	hasMessages := len(stages[3]) > 0
+	messageFailures, e := runStage(3)
+	if e != nil {
+		return e
+	}
+	if hasMessages && messageFailures == 0 {
+		snapshot.Complete = true
+		publish("messages", true)
+	}
+	if _, e = runStage(4); e != nil {
+		return e
+	}
+	if accountFiles != 1 {
+		snapshot.Owner = ""
+		s.SetSnapshot(slot, snapshot)
+	}
+	if !hasMessages {
+		return fmt.Errorf("no supported message files")
+	}
+	if count := issues.Load(); count > 0 {
+		return fmt.Errorf("%d files could not be fully imported; valid rows retained", count)
+	}
+	return nil
+}
+
+func parallelFiles(ctx context.Context, limiter chan struct{}, files []file, fn func(file) error) []error {
+	results := make([]error, len(files))
+	if len(files) == 0 {
+		return results
+	}
+	workers := min(len(files), max(1, cap(limiter)))
+	var next atomic.Int64
+	var group sync.WaitGroup
+	for range workers {
+		group.Go(func() {
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(files) {
+					return
+				}
+				select {
+				case limiter <- struct{}{}:
+				case <-ctx.Done():
+					results[i] = ctx.Err()
+					return
+				}
+				results[i] = fn(files[i])
+				<-limiter
+			}
+		})
+	}
+	group.Wait()
+	return results
+}
+
+func readMessages(r io.Reader, fn func(map[string]string) error) error {
+	d := json.NewDecoder(r)
+	d.UseNumber()
+	t, e := d.Token()
+	if e != nil {
+		return e
+	}
+	if t != json.Delim('[') {
+		return fmt.Errorf("messages must be a JSON array")
+	}
+	for d.More() {
+		m, e := walk(d, 0, nil, nil)
+		if e != nil {
+			return e
+		}
+		if e = fn(m); e != nil {
+			return e
+		}
+	}
+	if _, e = d.Token(); e != nil {
+		return e
+	}
+	_, e = d.Token()
+	if e == io.EOF {
+		return nil
+	}
+	if e == nil {
+		return fmt.Errorf("trailing message data")
+	}
+	return e
+}
+func label(v string) (string, string, string) {
+	if strings.HasPrefix(v, "Direct Message with ") {
+		if strings.Contains(v, "Unknown Participant") {
+			return v, "", "unknown-dm"
+		}
+		return v, "", "dm"
+	}
+	if i := strings.LastIndex(v, " in "); i >= 0 {
+		return v[:i], v[i+4:], "guild"
+	}
+	if strings.HasPrefix(strings.ToLower(v), "unknown channel, ") {
+		return "Unknown channel", v[len("Unknown channel, "):], "guild"
+	}
+	if v == "None" || v == "" {
+		return "", "", "unknown"
+	}
+	return v, "", "unknown"
+}
+func readCSV(r io.Reader, fn func(map[string]string) error) error {
+	c := csv.NewReader(r)
+	h, e := c.Read()
+	if e != nil {
+		return e
+	}
+	hasID := false
+	for i, v := range h {
+		h[i] = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(v), "\ufeff"))
+		hasID = hasID || h[i] == "id"
+	}
+	if !hasID {
+		return fmt.Errorf("missing CSV ID column")
+	}
+	for {
+		row, e := c.Read()
+		if e == io.EOF {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		m := map[string]string{}
+		for i, v := range row {
+			m[h[i]] = v
+		}
+		if e = fn(m); e != nil {
+			return e
+		}
+	}
+}

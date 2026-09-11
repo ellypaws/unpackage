@@ -1,0 +1,139 @@
+<p align="center">
+  <h1 align="center">unpackage</h1>
+</p>
+
+<p align="center">
+  Find messages that appear in an older Discord data package but not in a newer one.
+  Everything runs locally, so your Discord export stays on your computer.
+</p>
+
+<p align="center">
+  <a href="https://github.com/ellypaws/unpackage/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ellypaws/unpackage?include_prereleases&label=release&logo=github&color=5865f2"></a>
+  <a href="https://github.com/ellypaws/unpackage/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/ellypaws/unpackage/total?label=downloads&logo=github&color=5865f2"></a>
+  <a href="https://github.com/ellypaws/unpackage/actions"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/ellypaws/unpackage/build.yml?logo=githubactions&logoColor=white&label=build"></a>
+  <a href="https://go.dev/"><img alt="Go 1.27+" src="https://img.shields.io/badge/go-1.27%2B-00ADD8?logo=go&logoColor=white"></a>
+  <a href="https://github.com/ellypaws/unpackage"><img alt="Platform" src="https://img.shields.io/badge/platform-windows-0078d6?logo=windows&logoColor=white"></a>
+  <br>
+  <a href="https://github.com/ellypaws/unpackage/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/ellypaws/unpackage"></a>
+  <a href="https://github.com/ellypaws/unpackage/commits/main"><img alt="Commit activity" src="https://img.shields.io/github/commit-activity/m/ellypaws/unpackage"></a>
+  <a href="https://github.com/ellypaws/unpackage/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/ellypaws/unpackage?style=social"></a>
+</p>
+
+<p align="center"><a href="https://github.com/ellypaws/unpackage/releases/latest"><img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for%20Windows-5865f2?style=for-the-badge&logo=windows&logoColor=white"></a></p>
+
+---
+
+## What it does
+
+Discord lets you request a copy of your account data. If you have an older and a newer copy,
+unpackage compares the message IDs and shows what is present in the older package but missing
+from the newer one. It helps you investigate an export change and prepare a reviewable deletion
+request.
+
+The app is offline. It does not sign in to Discord, upload your packages, send a request, or delete
+messages. A missing message is a candidate for review, not proof that Discord deleted it.
+
+## Download
+
+> [!TIP]
+> Download **`unpackage-<version>-win-x64.exe`** from [Releases](https://github.com/ellypaws/unpackage/releases/latest).
+> It is a single Windows executable and needs no installer.
+
+Windows 10 or newer is recommended. A terminal window should be at least 64 columns wide and 24
+rows high for the full-screen interface.
+
+## Quick start
+
+1. Download the Windows executable from the release page.
+2. Open a terminal in the folder where you saved it.
+3. Start `unpackage.exe`.
+4. Choose the older and newer Discord package folders or ZIP files.
+5. Review the missing-message list, then narrow it by date, server, search text, or attachments.
+
+The app keeps what it reads in memory for the current session. It does not change your source
+packages. Close the app to clear the loaded data.
+
+## Try it without a Discord export
+
+The sample command creates fictional packages for a safe walkthrough. The destination folder must
+not already exist.
+
+```powershell
+unpackage.exe sample demo
+unpackage.exe
+```
+
+The sample contains edited messages and changed attachment URLs so you can see that matching is
+based on message IDs, not message text or attachment URLs.
+
+## Useful commands
+
+The full-screen app, console, and REPL use the same commands. In the Console tab or after starting
+`unpackage.exe repl`, try:
+
+```text
+open older "C:\Exports\older.zip"
+open newer "C:\Exports\newer"
+status
+mode missing
+servers
+dates "2022-11-19; 1,396 days ago"
+search "some text"
+list jsonl
+```
+
+Use `show MESSAGE_ID` for a complete row. Use `list jsonl` or `list tsv` to export the current
+results. Use `clear` to reset filters and `stop` to stop an import while keeping data already read.
+
+## Create a deletion-request draft
+
+Select one or more server IDs, then choose the scope of the draft:
+
+```text
+select 300000000000000001 300000000000000002
+request "deletion-request.txt" filtered
+```
+
+`filtered` uses the current filters. `all` includes every observed message from the selected
+servers. The draft contains server, channel, and message IDs for review. It does not include
+message bodies or attachment URLs, and it is never sent automatically.
+
+## Command-line comparison
+
+For a script-friendly JSONL result:
+
+```powershell
+unpackage.exe diff "C:\Exports\older.zip" "C:\Exports\newer" > missing.jsonl
+```
+
+Add `--format tsv` for tab-separated output. You can also use `--server ID`, `--date DATE`,
+`--search TEXT`, `--media all|attachments|media`, and `--mode missing|all|older|newer|present`.
+
+## Keyboard shortcuts
+
+`Tab` and `Shift+Tab` move focus. `Enter` activates a control. `Ctrl+Tab` switches tabs. `F1`
+opens help. `Ctrl+O`, `Ctrl+N`, and `Ctrl+D` open the older package, newer package, and calendar
+controls. `Ctrl+X` stops an import, `Esc` closes an open panel, and `Ctrl+C` exits.
+
+## Build from source
+
+You need Go 1.27 or newer:
+
+```powershell
+$env:CGO_ENABLED = '0'
+go build -o unpackage.exe ./cmd
+.\unpackage.exe
+```
+
+## Privacy and limits
+
+The program reads exported package files locally and stores parsed messages in memory. It creates
+no database and does not make network requests at runtime. Logs record import status, not message
+bodies, account names, package paths, or attachment URLs.
+
+Discord export omissions can reflect a change in export scope or access. Compare the packages in
+the order you provide them, and review every result before treating it as a deletion candidate.
+
+## License
+
+See the repository for the project license.

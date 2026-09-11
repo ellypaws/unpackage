@@ -1,0 +1,44 @@
+.idea
+vendor
+cache
+logs
+
+# config
+*.txt
+*.json
+!app/package.json
+!app/tsconfig.json
+*.exe
+*.env
+.env.local
+*.log
+*.xlsx
+*.csv
+
+# images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# test files
+*_test.go
+
+# database files
+sqlite.db
+*.db
+private/
+
+# bin
+cmd/main
+cmd/data
+*.zip
+
+# misc
+.agents
+*.md
+!README.md
+*.lock
+AGENTS.md
+CLAUDE.md
