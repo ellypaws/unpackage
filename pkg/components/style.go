@@ -16,6 +16,7 @@ import (
 var Accent = lipgloss.Color("#B59AF6")
 var Muted = lipgloss.Color("#A4A6B5")
 var Warn = lipgloss.NewStyle().Foreground(lipgloss.Color("#E8BE79"))
+var Deleted = lipgloss.Color("#F7768E")
 var Title = lipgloss.NewStyle().Bold(true).Foreground(Accent)
 var Border = lipgloss.Color("#57516D")
 var Surface = lipgloss.Color("#252331")

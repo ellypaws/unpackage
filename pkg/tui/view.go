@@ -130,7 +130,11 @@ func (m *Model) View() string {
 		} else if r.HasAttachments {
 			attachment = "Attachment"
 		}
-		content := components.Title.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(store.LocalDate(r.Date)) + "\n\n" + components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render("Attachment  "+attachment+"\nServer      "+r.Guild+"\nChannel     "+r.Channel+"\nMessage     "+r.ID)
+		titleStyle := components.Title
+		if r.Status == "missing" {
+			titleStyle = titleStyle.Foreground(components.Deleted)
+		}
+		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(store.LocalDate(r.Date)) + "\n\n" + components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render("Attachment  "+attachment+"\nServer      "+r.Guild+"\nChannel     "+r.Channel+"\nMessage     "+r.ID)
 		m.Viewport.SetContent(lipgloss.NewStyle().Width(w - 4).Render(content))
 		body = m.button("detail-close", "Back to results", false) + "\n\n" + m.Viewport.View()
 	} else {
@@ -403,6 +407,9 @@ func (m *Model) messages(w, h int) string {
 			metaWidth -= lipgloss.Width(action) + 1
 		}
 		nameWidth := max(8, metaWidth-lipgloss.Width(date)-2)
+		if r.Status == "missing" {
+			metaStyle = metaStyle.Foreground(components.Deleted)
+		}
 		name := metaStyle.Render(components.Fit(r.Server+" / "+displayChannel(r), nameWidth))
 		meta := name + strings.Repeat(" ", max(1, metaWidth-lipgloss.Width(name)-lipgloss.Width(date))) + date
 		if action != "" {

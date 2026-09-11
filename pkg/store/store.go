@@ -322,8 +322,9 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		return nil, fmt.Errorf("unknown media filter %q", f.Media)
 	}
 	type item struct {
-		m Message
-		c channel
+		m       Message
+		c       channel
+		missing bool
 	}
 	var items []item
 	for slot, ms := range s.messages {
@@ -371,7 +372,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				c = merge(s.channels[0][m.Channel], s.channels[1][m.Channel])
 			}
 			c = applyServerLabel(c, labels)
-			items = append(items, item{m, c})
+			items = append(items, item{m: m, c: c, missing: same && slot == 0 && !inNew})
 		}
 	}
 	s.mu.RUnlock()
@@ -407,7 +408,9 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			}
 		}
 		status := "observed"
-		if mode == "missing" || mode == "present" || mode == "new" {
+		if v.missing {
+			status = "missing"
+		} else if mode == "present" || mode == "new" {
 			status = mode
 		}
 		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: cmp.Or(c.name, m.Channel), Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia})
