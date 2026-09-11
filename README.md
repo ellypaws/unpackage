@@ -53,6 +53,14 @@ rows high for the full-screen interface.
 The app keeps what it reads in memory for the current session. It does not change your source
 packages. Close the app to clear the loaded data.
 
+The package browser keeps parent folders visible in columns. Hover a narrow column to expand it.
+Type part of a folder name to filter and highlight fuzzy matches, then use `Tab` to complete the
+first match. A trailing slash enters a directory. `Choose this package` selects the named folder
+or ZIP. Directory counts appear as they finish and hide when space is limited.
+
+The older and newer browsers share their starting location until each has a selected package.
+After that, each remembers its own location for the current session.
+
 ## Try it without a Discord export
 
 The sample command creates fictional packages for a safe walkthrough. The destination folder must
@@ -114,6 +122,10 @@ Add `--format tsv` for tab-separated output. You can also use `--server ID`, `--
 `Tab` and `Shift+Tab` move focus. `Enter` activates a control. `Ctrl+Tab` switches tabs. `F1`
 opens help. `Ctrl+O`, `Ctrl+N`, and `Ctrl+D` open the older package, newer package, and calendar
 controls. `Ctrl+X` stops an import, `Esc` closes an open panel, and `Ctrl+C` exits.
+
+In the package browser, `Tab` completes the first match, `Ctrl+Tab` and `Shift+Tab` move focus,
+and `Ctrl+O` chooses the selected package. `Alt+Up` opens the parent folder, `Alt+Left` and
+`Alt+Right` move through history, and `Alt+Down` enters the highlighted row.
 
 ## Build from source
 

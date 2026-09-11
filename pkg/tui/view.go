@@ -10,7 +10,6 @@ import (
 	"github.com/76creates/stickers/flexbox"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/ellypaws/unpackage/pkg/components"
 	"github.com/ellypaws/unpackage/pkg/session"
@@ -18,6 +17,9 @@ import (
 )
 
 func (m *Model) button(id, label string, active bool) string {
+	if !m.enabled(id) {
+		return components.DisabledButton(label)
+	}
 	m.Actions = append(m.Actions, id)
 	return components.Button(m.Zones, id, label, m.Hover, m.Focus, active)
 }
@@ -41,16 +43,17 @@ func (m *Model) resultHeight() int {
 }
 func (m *Model) pageSize() int { return max(1, m.resultHeight()/2) }
 func (m *Model) field(id string, input *textinput.Model, w int) string {
+	actionID := map[string]string{"days-input": "days-apply", "search-input": "search-apply", "servers-input": "servers-search", "request-path": "request-save", "command": "command-run"}[id]
+	action := ""
+	if actionID != "" {
+		label := "→"
+		if id == "days-input" {
+			label = "+"
+		}
+		action = m.button(actionID, label, false)
+	}
 	m.Actions = append(m.Actions, id)
-	input.Width = max(4, w-4)
-	border := components.Border
-	if m.Hover == id || m.Focus == id {
-		border = components.Accent
-	}
-	if (id == "search-input" || id == "servers-input") && input.Value() != "" {
-		border = lipgloss.Color("#E8BE79")
-	}
-	return m.Zones.Mark(id, lipgloss.NewStyle().Width(w-2).Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(border).Render(ansi.Truncate(input.View(), w-4, "")))
+	return components.InputField(m.Zones, id, input, w, m.Hover, m.Focus, action, "")
 }
 func (m *Model) modal(body string) string {
 	panel := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(components.Accent).Padding(1, 2).Render(body)
@@ -64,21 +67,19 @@ func (m *Model) View() string {
 		return components.Title.Render("Find missing messages") + "\nResize to at least 64 × 24."
 	}
 	if m.Picker != nil {
-		m.Picker.Height = max(1, m.Height-19)
-		m.Picker.Path.Width = max(10, w-10)
-		m.Actions = []string{"pick-back", "pick-forward", "pick-up", "pick-home", "pick-open", "pick-use", "pick-close", "pick-input"}
-		for i := m.Picker.Offset; i < min(len(m.Picker.Entries), m.Picker.Offset+m.Picker.Height); i++ {
-			m.Actions = append(m.Actions, fmt.Sprintf("entry-%d", i))
-		}
+		m.Picker.Height = max(1, m.Height-17)
 		heading := components.Title.Render([]string{"Older package", "Newer package"}[m.PickSlot])
-		return m.Zones.Scan(lipgloss.NewStyle().Padding(0, 2).Render(heading + "\n" + m.Picker.View(m.Zones, w, m.Hover, m.Focus)))
+		body := m.Picker.View(m.Zones, w, m.Hover, m.Focus)
+		m.Actions = m.Picker.Actions
+		return m.Zones.Scan(lipgloss.NewStyle().Padding(0, 2).Render(heading + "\n" + body))
 	}
 	if m.Calendar != nil {
 		m.Actions = []string{"cal-prev", "cal-next", "cal-apply", "cal-clear", "cal-close"}
+		m.Actions = slices.DeleteFunc(m.Actions, func(id string) bool { return !m.enabled(id) })
 		for d := 1; d <= m.Calendar.Month.AddDate(0, 1, -1).Day(); d++ {
 			m.Actions = append(m.Actions, "date-"+m.Calendar.Month.AddDate(0, 0, d-1).Format(time.DateOnly))
 		}
-		return m.modal(m.Calendar.View(m.Zones, m.Hover, m.Focus))
+		return m.modal(m.Calendar.View(m.Zones, m.Hover, m.Focus, m.enabled("cal-apply")))
 	}
 	if m.MarginDialog {
 		before := "Days before\n" + m.field("margin-before", &m.BeforeInput, 10)
@@ -105,7 +106,7 @@ func (m *Model) View() string {
 		if m.RequestScope == "filtered" {
 			scope = "Current matching messages"
 		}
-		body := components.Title.Render("Deletion request") + "\n\n" + fmt.Sprintf("%d servers selected", len(m.Session.Filter.Guilds)) + "\n\n" + m.button("scope", scope, false) + "\n\n" + m.field("request-path", &m.RequestInput, width) + "\n\n" + m.button("request-save", "Save draft", true) + "  " + m.button("request-close", "Cancel", false)
+		body := components.Title.Render("Deletion request") + "\n\n" + fmt.Sprintf("%d servers selected", len(m.Session.Filter.Guilds)) + "\n\n" + m.button("scope", scope, false) + "\n\n" + m.field("request-path", &m.RequestInput, width) + "\n\n" + m.button("request-close", "Cancel", false)
 		if m.Notice != "" && m.Notice != "Done" {
 			body += "\n\n" + components.Fit(m.Notice, width)
 		}
@@ -261,7 +262,7 @@ func (m *Model) investigate(w, h int) string {
 }
 func (m *Model) filters(w int) string {
 	parts := []string{m.field("search-input", &m.SearchInput, min(36, w)), components.Title.Render("Message dates"), m.field("days-input", &m.DayInput, min(34, w))}
-	parts = append(parts, m.button("days-apply", "Add", false)+" "+m.button("dates", "Calendar", false)+" "+m.button("dates-clear", "Clear", false))
+	parts = append(parts, m.button("dates", "Choose dates", false)+" "+m.button("dates-clear", "Clear", false))
 	parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Separate multiple dates with ;"))
 	dates := m.Session.Filter.Dates
 	if len(dates) == 0 {

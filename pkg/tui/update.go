@@ -47,17 +47,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return nil
 		}
 	case dropPathMsg:
-		if v.Revision != m.DropRevision || m.Executing {
+		if v.Revision != m.DropRevision || m.Executing || m.Picker != nil {
 			return m, nil
 		}
 		m.DropBuffer = ""
-		if m.Picker != nil {
-			m.Picker.Path.SetValue(v.Path)
-			m.Picker.Path.CursorEnd()
-			m.Focus = "pick-input"
-			return m, m.Picker.Navigate(v.Path)
-		}
 		slot := v.Slot
+		m.rememberPackage(slot, v.Path)
 		m.DropSlot = slot
 		m.Tab = tabInvestigate
 		m.PackagesExpanded = true
@@ -70,7 +65,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Viewport.Width = max(10, m.Width-4)
 		m.Viewport.Height = max(3, m.Height-13)
 		if m.Picker != nil {
-			m.Picker.Height = max(1, m.Height-15)
+			return m, tea.Batch(m.Picker.Resize(m.Width-4, max(1, m.Height-17)), m.changed())
 		}
 		return m, m.changed()
 	case tickMsg:
@@ -141,32 +136,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refresh()
 	case components.DirectoryMsg:
 		if m.Picker != nil {
-			m.Picker.Apply(v)
-			m.Focus = "pick-input"
+			return m, m.Picker.Apply(v)
 		}
 		return m, nil
-	case components.CompletionMsg:
-		if m.Picker == nil || components.CleanPath(m.Picker.Path.Value()) != v.Value {
-			return m, nil
-		}
-		if v.Err != nil {
-			m.Picker.Err = v.Err.Error()
-			return m, nil
-		}
-		if len(v.Candidates) == 0 {
-			m.Picker.Err = "No matching folders or ZIP files"
-			return m, nil
-		}
-		m.Picker.Path.SetValue(v.Candidates[0])
-		m.Picker.Path.CursorEnd()
-		if len(v.Candidates) > 1 {
-			m.Picker.Err = fmt.Sprintf("%d matches; first completion shown", len(v.Candidates))
+	case components.DirectoryCountMsg:
+		if m.Picker != nil {
+			return m, m.Picker.ApplyCount(v)
 		}
 		return m, nil
 	case components.PickedMsg:
-		if m.Picker == nil {
+		if m.Picker == nil || v.Generation != m.Picker.Generation {
 			return m, nil
 		}
+		m.rememberPackage(m.PickSlot, v.Path)
+		m.Picker.Close()
 		m.Picker = nil
 		m.Focus = m.defaultFocus()
 		m.focusInput()
@@ -175,6 +158,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Hover = ""
 		return m, nil
 	case tea.MouseMsg:
+		if m.Picker != nil {
+			local := v
+			local.X -= 2
+			local.Y--
+			id, cmd := m.Picker.Mouse(local)
+			if id != "" {
+				m.Hover = id
+				if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft {
+					m.Focus = "pick-input"
+					m.focusInput()
+					return m, tea.Batch(cmd, m.action(id))
+				}
+				return m, cmd
+			}
+		}
 		m.Hover = ""
 		for _, id := range m.Actions {
 			if m.Zones.Get(id).InBounds(v) {
@@ -194,7 +192,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delta = -1
 			}
 			if m.Picker != nil {
-				m.Picker.Offset = max(0, min(max(0, len(m.Picker.Entries)-m.Picker.Height), m.Picker.Offset+delta*3))
 				return m, nil
 			}
 			if m.Detail != nil || m.Tab == tabLog || m.Tab == tabConsole {
@@ -221,7 +218,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		key := v.String()
-		if len(v.Runes) > 0 && !m.Executing && m.Calendar == nil && !m.RequestDialog && !m.MarginDialog {
+		if len(v.Runes) > 0 && !m.Executing && m.Picker == nil && m.Calendar == nil && !m.RequestDialog && !m.MarginDialog {
 			text := string(v.Runes)
 			if time.Since(m.DropTime) > 80*time.Millisecond || v.Paste {
 				m.DropBuffer = ""
@@ -248,29 +245,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.PendingDropSlot = m.DropSlot
 			}
 			if filepath.IsAbs(components.CleanPath(candidate)) {
-				if m.Picker != nil {
-					m.Picker.Path.SetValue(candidate)
-					m.Picker.Path.CursorEnd()
-				} else {
-					switch m.DropFocus {
-					case "days-input":
-						m.DayInput.SetValue(m.DropInput)
-					case "search-input":
-						m.SearchInput.SetValue(m.DropInput)
-					}
-					m.Tab = tabInvestigate
-					m.PackagesExpanded = true
-					m.Notice = "Opening " + []string{"older", "newer"}[m.PendingDropSlot] + " package…"
+				switch m.DropFocus {
+				case "days-input":
+					m.DayInput.SetValue(m.DropInput)
+				case "search-input":
+					m.SearchInput.SetValue(m.DropInput)
 				}
+				m.Tab = tabInvestigate
+				m.PackagesExpanded = true
+				m.Notice = "Opening " + []string{"older", "newer"}[m.PendingDropSlot] + " package…"
 				slot := m.PendingDropSlot
 				return m, tea.Tick(180*time.Millisecond, func(time.Time) tea.Msg { return dropCheckMsg{candidate, revision, slot} })
 			}
 		}
 		if key == "ctrl+c" {
+			if m.Picker != nil {
+				m.Picker.Close()
+			}
 			m.Session.Stop()
 			return m, tea.Quit
 		}
 		if key == "esc" {
+			if m.Picker != nil {
+				m.rememberBrowsing()
+				m.Picker.Close()
+			}
 			m.Picker = nil
 			m.Calendar = nil
 			m.Detail = nil
@@ -289,9 +288,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.Picker != nil {
-			if key == "ctrl+tab" {
+			if key == "ctrl+tab" || key == "shift+tab" {
 				i := slices.Index(m.Actions, m.Focus)
-				m.Focus = m.Actions[(i+1)%len(m.Actions)]
+				step := 1
+				if key == "shift+tab" {
+					step = -1
+				}
+				if len(m.Actions) > 0 {
+					m.Focus = m.Actions[(i+step+len(m.Actions))%len(m.Actions)]
+				}
+				m.focusInput()
 				return m, nil
 			}
 			if key == "enter" && m.Focus != "pick-input" {
@@ -300,12 +306,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key == "tab" && m.Focus != "pick-input" {
 				m.Focus = "pick-input"
 			}
+			if len(v.Runes) > 0 {
+				m.Focus = "pick-input"
+			}
+			m.focusInput()
 			return m, m.Picker.Update(msg)
 		}
 		if m.Calendar != nil {
 			c := m.Calendar
 			if key == "tab" || key == "shift+tab" {
 				controls := []string{"cal-prev", "cal-next", "cal-apply", "cal-clear", "cal-close"}
+				controls = slices.DeleteFunc(controls, func(id string) bool { return !m.enabled(id) })
 				i := slices.Index(controls, m.Focus)
 				step := 1
 				if key == "shift+tab" {
@@ -466,19 +477,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch key {
 		case "enter":
-			line := m.Input.Value()
-			if p := components.CleanPath(line); p != "" {
-				if _, e := os.Stat(p); e == nil {
-					m.PickSlot = 0
-					if len(m.Snapshots) > 0 {
-						m.PickSlot = 1
-					}
-					picker := components.NewPicker(p)
-					m.Picker = &picker
-					return m, m.Picker.Navigate(p)
-				}
-			}
-			return m, m.run(line)
+			return m, m.submitCommand()
 		case "up":
 			if len(m.History) > 0 {
 				m.HistoryIndex = max(0, m.HistoryIndex-1)
@@ -501,7 +500,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(m.Snapshots) > 0 {
 					m.PickSlot = 1
 				}
-				picker := components.NewPicker(p)
+				picker := components.NewPicker(m.ctx, p)
 				m.Picker = &picker
 				return m, m.Picker.Navigate(p)
 			}
@@ -535,17 +534,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 func (m *Model) action(id string) tea.Cmd {
-	if m.Executing && id != "stop" {
+	if !m.enabled(id) {
 		return nil
 	}
-	if strings.HasPrefix(id, "pick-") || strings.HasPrefix(id, "entry-") {
+	if strings.HasPrefix(id, "pick-") {
 		if id == "pick-close" {
+			if m.Picker != nil {
+				m.rememberBrowsing()
+				m.Picker.Close()
+			}
 			m.Picker = nil
 			m.Focus = m.defaultFocus()
 			m.focusInput()
 			return nil
 		}
 		if m.Picker != nil {
+			m.Focus = "pick-input"
+			m.focusInput()
 			return m.Picker.Action(id)
 		}
 	}
@@ -648,11 +653,20 @@ func (m *Model) action(id string) tea.Cmd {
 			m.PickSlot = 1
 		}
 		m.DropSlot = m.PickSlot
-		cwd, _ := os.Getwd()
-		p := components.NewPicker(cwd)
+		cwd := m.BrowseDirs[m.PickSlot]
+		if cwd == "" {
+			cwd = m.SharedBrowseDir
+		}
+		if cwd == "" {
+			cwd, _ = os.Getwd()
+		}
+		p := components.NewPicker(m.ctx, cwd)
 		p.Height = max(1, m.Height-15)
 		m.Picker = &p
+		m.DropRevision++
+		m.DropBuffer = ""
 		m.Focus = "pick-input"
+		m.focusInput()
 		return p.Navigate(cwd)
 	case "stop":
 		m.Session.Stop()
@@ -731,6 +745,8 @@ func (m *Model) action(id string) tea.Cmd {
 		m.ServerRevision++
 		m.ServerSearch = m.ServerInput.Value()
 		m.ServerOffset = 0
+		m.Focus = "servers-input"
+		m.focusInput()
 	case "filters":
 		m.FilterDialog = true
 		m.Focus = "days-input"
@@ -794,6 +810,8 @@ func (m *Model) action(id string) tea.Cmd {
 		m.Session.Filter.From = ""
 		m.Session.Filter.Until = ""
 		m.Notice = ""
+		m.Focus = "days-input"
+		m.focusInput()
 		return m.changed()
 	case "dates-clear":
 		m.DayInput.SetValue("")
@@ -804,7 +822,13 @@ func (m *Model) action(id string) tea.Cmd {
 	case "search-apply":
 		m.SearchRevision++
 		m.Session.Filter.Search = m.SearchInput.Value()
+		m.Focus = "search-input"
+		m.focusInput()
 		return m.changed()
+	case "command-run":
+		m.Focus = "command"
+		m.focusInput()
+		return m.submitCommand()
 	case "detail-close":
 		m.Detail = nil
 	case "command":
@@ -817,6 +841,9 @@ func (m *Model) action(id string) tea.Cmd {
 
 func (m *Model) focusInput() {
 	inputs := map[string]*textinput.Model{"command": &m.Input, "days-input": &m.DayInput, "search-input": &m.SearchInput, "request-path": &m.RequestInput, "margin-before": &m.BeforeInput, "margin-after": &m.AfterInput, "servers-input": &m.ServerInput}
+	if m.Picker != nil {
+		inputs["pick-input"] = &m.Picker.Path
+	}
 	if input := inputs[m.Focus]; input != nil && input.Focused() {
 		return
 	}
@@ -827,7 +854,14 @@ func (m *Model) focusInput() {
 	m.BeforeInput.Blur()
 	m.AfterInput.Blur()
 	m.ServerInput.Blur()
+	if m.Picker != nil {
+		m.Picker.Path.Blur()
+	}
 	switch m.Focus {
+	case "pick-input":
+		if m.Picker != nil {
+			m.Picker.Path.Focus()
+		}
 	case "command":
 		if m.Tab == tabConsole {
 			m.Input.Focus()
@@ -846,6 +880,51 @@ func (m *Model) focusInput() {
 		m.AfterInput.Focus()
 	}
 }
+
+func (m *Model) rememberPackage(slot int, path string) {
+	abs, err := filepath.Abs(components.CleanPath(path))
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(abs)
+	m.BrowseDirs[slot] = dir
+	m.BrowseChosen[slot] = true
+	m.SharedBrowseDir = dir
+	if !m.BrowseChosen[1-slot] {
+		m.BrowseDirs[1-slot] = dir
+	}
+}
+
+func (m *Model) rememberBrowsing() {
+	dir := m.Picker.Dir
+	if dir == "" {
+		return
+	}
+	m.BrowseDirs[m.PickSlot] = dir
+	if !m.BrowseChosen[1-m.PickSlot] {
+		m.SharedBrowseDir = dir
+		m.BrowseDirs[1-m.PickSlot] = dir
+	}
+}
+
+func (m *Model) submitCommand() tea.Cmd {
+	line := m.Input.Value()
+	if path := components.CleanPath(line); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			m.PickSlot = 0
+			if len(m.Snapshots) > 0 {
+				m.PickSlot = 1
+			}
+			picker := components.NewPicker(m.ctx, path)
+			m.Picker = &picker
+			m.Focus = "pick-input"
+			m.focusInput()
+			return picker.Navigate(path)
+		}
+	}
+	return m.run(line)
+}
+
 func (m *Model) updateSearch(msg tea.Msg, server bool) tea.Cmd {
 	input := &m.SearchInput
 	if server {

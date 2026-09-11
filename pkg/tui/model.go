@@ -72,6 +72,9 @@ type Model struct {
 	Picker                                        *components.Picker
 	Calendar                                      *components.Calendar
 	PickSlot                                      int
+	BrowseDirs                                    [2]string
+	BrowseChosen                                  [2]bool
+	SharedBrowseDir                               string
 	Hover, Focus, Notice                          string
 	Actions                                       []string
 	Rows                                          []store.Row

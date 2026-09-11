@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone"
@@ -15,6 +16,7 @@ import (
 
 var Accent = lipgloss.Color("#B59AF6")
 var Muted = lipgloss.Color("#A4A6B5")
+var MutedStyle = lipgloss.NewStyle().Foreground(Muted)
 var Warn = lipgloss.NewStyle().Foreground(lipgloss.Color("#E8BE79"))
 var Deleted = lipgloss.Color("#F7768E")
 var Title = lipgloss.NewStyle().Bold(true).Foreground(Accent)
@@ -23,6 +25,31 @@ var Surface = lipgloss.Color("#252331")
 var Text = lipgloss.Color("#E1DDEB")
 
 func Fit(s string, w int) string { return ansi.Truncate(session.Safe(s), max(1, w), "…") }
+func DisabledButton(label string) string {
+	return lipgloss.NewStyle().Foreground(Border).Padding(0, 1).Render(label)
+}
+
+func InputField(z *zone.Manager, id string, input *textinput.Model, width int, hover, focus, action, hint string) string {
+	contentWidth := max(1, width-4)
+	textWidth := max(1, contentWidth-lipgloss.Width(action))
+	if input.Position() != len([]rune(input.Value())) {
+		hint = ""
+	}
+	if hint != "" {
+		hint = " " + Fit(hint, max(1, textWidth/2-1))
+	}
+	inputWidth := max(1, textWidth-lipgloss.Width(hint))
+	input.Width = max(1, inputWidth-lipgloss.Width(input.Prompt)-1)
+	input.SetCursor(input.Position())
+	border := Border
+	if hover == id || focus == id {
+		border = Accent
+	}
+	body := ansi.Truncate(input.View(), inputWidth, "")
+	body = lipgloss.NewStyle().Width(inputWidth).Render(body) + MutedStyle.Render(hint) + action
+	return z.Mark(id, lipgloss.NewStyle().Width(width-2).Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(border).Render(body))
+}
+
 func Button(z *zone.Manager, id, label, hover, focus string, active bool) string {
 	st := lipgloss.NewStyle().Foreground(Text).Background(Surface).Padding(0, 1)
 	prefix := ""

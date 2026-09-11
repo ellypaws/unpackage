@@ -26,7 +26,7 @@ func (c *Calendar) Toggle(day string) {
 	}
 	slices.Sort(c.Dates)
 }
-func (c Calendar) View(z *zone.Manager, hover, focus string) string {
+func (c Calendar) View(z *zone.Manager, hover, focus string, canApply bool) string {
 	var b strings.Builder
 	b.WriteString(Title.Render("Dates") + "\n\n")
 	b.WriteString(Button(z, "cal-prev", "‹", hover, focus, false) + " " + c.Month.Format("January 2006") + " " + Button(z, "cal-next", "›", hover, focus, false) + "\n\n Mo   Tu   We   Th   Fr   Sa   Su\n")
@@ -47,7 +47,14 @@ func (c Calendar) View(z *zone.Manager, hover, focus string) string {
 			b.WriteByte('\n')
 		}
 	}
-	b.WriteString("\n\n" + Button(z, "cal-apply", "Apply", hover, focus, false) + Button(z, "cal-clear", "Clear", hover, focus, false) + Button(z, "cal-close", "Cancel", hover, focus, false) + "\n\nArrows move, Space selects, Enter applies, Esc cancels\n")
+	apply, clear := DisabledButton("Apply"), DisabledButton("Clear")
+	if canApply {
+		apply = Button(z, "cal-apply", "Apply", hover, focus, false)
+	}
+	if len(c.Dates) > 0 {
+		clear = Button(z, "cal-clear", "Clear", hover, focus, false)
+	}
+	b.WriteString("\n\n" + apply + clear + Button(z, "cal-close", "Cancel", hover, focus, false) + "\n\nArrows move, Space selects, Enter applies, Esc cancels\n")
 	b.WriteString(fmt.Sprintf("%d days selected", len(c.Dates)))
 	return b.String()
 }

@@ -1,16 +1,18 @@
 package components
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
 )
 
 type Entry struct {
@@ -18,228 +20,594 @@ type Entry struct {
 	Dir  bool
 	Size int64
 }
-type DirectoryMsg struct {
-	Path       string
-	Entries    []Entry
-	Err        error
-	Generation int
-}
-type PickedMsg struct{ Path string }
-type CompletionMsg struct {
-	Value      string
-	Candidates []string
-	Err        error
-}
-type Picker struct {
-	Path                               textinput.Model
-	Dir                                string
-	Entries                            []Entry
-	Cursor, Offset, Height, Generation int
-	Err                                string
-	Loading                            bool
-	history                            []string
-	future                             []string
+
+type Column struct {
+	Path    string
+	Entries []Entry
+	Matches []int
+	Offset  int
 }
 
-func NewPicker(start string) Picker {
-	t := textinput.New()
-	t.Prompt = "Path › "
-	t.CharLimit = 4096
-	t.SetValue(start)
-	t.Focus()
-	return Picker{Path: t, Dir: start, Height: 12}
+type DirectoryMsg struct {
+	Columns                []Column
+	Query, Selected, Input string
+	Err                    error
+	Generation             uint64
 }
+
+type DirectoryCountMsg struct {
+	Path       string
+	Count      int
+	Err        error
+	Generation uint64
+}
+
+type PickedMsg struct {
+	Path       string
+	Generation uint64
+}
+
+type columnBounds struct{ Index, X, Y, Width int }
+
+type Picker struct {
+	Path            textinput.Model
+	Dir             string
+	Columns         []Column
+	Cursor, Height  int
+	Generation      uint64
+	Err             string
+	Loading         bool
+	Actions         []string
+	query, selected string
+	hint            string
+	pendingAction   string
+	expanded        int
+	bounds          []columnBounds
+	history, future []string
+	historyMove     bool
+	parent          context.Context
+	ctx             context.Context
+	cancel          context.CancelFunc
+	counts          map[string]int
+	pending         map[string]bool
+}
+
+var pickerGeneration atomic.Uint64
+
+func NewPicker(ctx context.Context, start string) Picker {
+	t := textinput.New()
+	t.Prompt = ""
+	t.CharLimit = 4096
+	t.PlaceholderStyle = MutedStyle
+	t.SetValue(start)
+	t.CursorEnd()
+	t.Focus()
+	return Picker{Path: t, Height: 12, expanded: -1, parent: ctx, counts: map[string]int{}, pending: map[string]bool{}}
+}
+
 func CleanPath(p string) string {
 	p = strings.TrimSpace(p)
 	p = strings.TrimPrefix(p, "& ")
 	p = strings.Trim(p, "\"'")
 	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, "~\\") {
 		if h, e := os.UserHomeDir(); e == nil {
-			p = filepath.Join(h, strings.TrimLeft(p[1:], "/\\"))
+			p = h + p[1:]
 		}
 	}
 	return p
 }
-func (p *Picker) Navigate(dest string) tea.Cmd {
-	dest = CleanPath(dest)
-	p.Generation++
-	gen := p.Generation
-	p.Loading = true
-	p.Err = ""
-	return func() tea.Msg {
-		abs, e := filepath.Abs(dest)
-		if e != nil {
-			return DirectoryMsg{Generation: gen, Err: e}
-		}
-		st, e := os.Stat(abs)
-		if e != nil {
-			return DirectoryMsg{Generation: gen, Err: e}
-		}
-		if !st.IsDir() {
-			if strings.EqualFold(filepath.Ext(abs), ".zip") {
-				return PickedMsg{abs}
-			}
-			return DirectoryMsg{Generation: gen, Err: fmt.Errorf("choose a folder or ZIP")}
-		}
-		es, e := os.ReadDir(abs)
-		var out []Entry
-		for _, v := range es {
-			if v.Type()&os.ModeSymlink != 0 {
-				continue
-			}
-			if v.IsDir() || strings.EqualFold(filepath.Ext(v.Name()), ".zip") {
-				size := int64(0)
-				if info, er := v.Info(); er == nil {
-					size = info.Size()
-				}
-				out = append(out, Entry{v.Name(), v.IsDir(), size})
-			}
-		}
-		slices.SortFunc(out, func(a, b Entry) int {
-			if a.Dir != b.Dir {
-				if a.Dir {
-					return -1
-				}
-				return 1
-			}
-			return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
-		})
-		return DirectoryMsg{Path: abs, Entries: out, Err: e, Generation: gen}
+
+func directoryPath(path string) string {
+	if path != "" && !os.IsPathSeparator(path[len(path)-1]) {
+		return path + string(filepath.Separator)
+	}
+	return path
+}
+
+func (p *Picker) Close() {
+	if p.cancel != nil {
+		p.cancel()
 	}
 }
-func (p *Picker) Apply(m DirectoryMsg) {
-	if m.Generation != p.Generation {
-		return
+
+func (p *Picker) Navigate(dest string) tea.Cmd {
+	dest = CleanPath(dest)
+	if !strings.EqualFold(filepath.Ext(dest), ".zip") {
+		dest = directoryPath(dest)
+	}
+	p.Path.SetValue(dest)
+	p.Path.CursorEnd()
+	return p.resolve(true)
+}
+
+func (p *Picker) resolve(navigate bool) tea.Cmd {
+	p.Close()
+	p.ctx, p.cancel = context.WithCancel(p.parent)
+	p.Generation = pickerGeneration.Add(1)
+	p.pending = map[string]bool{}
+	p.Loading = true
+	p.Err = ""
+	p.selected = ""
+	p.hint = ""
+	p.pendingAction = ""
+	input, gen, ctx := p.Path.Value(), p.Generation, p.ctx
+	cache := make(map[string][]Entry, len(p.Columns))
+	for _, col := range p.Columns {
+		cache[col.Path] = col.Entries
+	}
+	return func() tea.Msg { return resolveDirectory(ctx, input, gen, cache, navigate) }
+}
+
+func readEntries(ctx context.Context, path string) ([]Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var entries []Entry
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		batch, err := f.ReadDir(128)
+		for _, entry := range batch {
+			if entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if entry.IsDir() {
+				entries = append(entries, Entry{Name: entry.Name(), Dir: true})
+			} else if strings.EqualFold(filepath.Ext(entry.Name()), ".zip") {
+				v := Entry{Name: entry.Name()}
+				if info, e := entry.Info(); e == nil {
+					v.Size = info.Size()
+				}
+				entries = append(entries, v)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	slices.SortFunc(entries, func(a, b Entry) int {
+		if a.Dir != b.Dir {
+			if a.Dir {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+	})
+	return entries, nil
+}
+
+func resolveDirectory(ctx context.Context, input string, gen uint64, cache map[string][]Entry, navigate bool) (m DirectoryMsg) {
+	m = DirectoryMsg{Input: input, Generation: gen}
+	defer func() {
+		for i := range m.Columns {
+			query := ""
+			if i == len(m.Columns)-1 {
+				query = m.Query
+			}
+			m.Columns[i].Matches = matchingEntries(m.Columns[i].Entries, query, false)
+		}
+	}()
+	value := CleanPath(input)
+	if value == "" {
+		return m
+	}
+	trailing := os.IsPathSeparator(value[len(value)-1])
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		m.Err = err
+		return m
+	}
+	root := filepath.VolumeName(abs) + string(filepath.Separator)
+	parts := strings.FieldsFunc(strings.TrimPrefix(abs, root), func(r rune) bool { return r < 128 && os.IsPathSeparator(uint8(r)) })
+	path := root
+	for i := 0; ; i++ {
+		if err := ctx.Err(); err != nil {
+			m.Err = err
+			return m
+		}
+		entries, ok := cache[path]
+		if !ok {
+			entries, err = readEntries(ctx, path)
+		}
+		if err != nil {
+			m.Err = err
+			return m
+		}
+		m.Columns = append(m.Columns, Column{Path: path, Entries: entries})
+		if i == len(parts) {
+			m.Selected = path
+			return m
+		}
+		if i == len(parts)-1 && !trailing {
+			m.Query = parts[i]
+			for _, entry := range entries {
+				if equalPath(entry.Name, parts[i]) {
+					m.Selected = filepath.Join(path, entry.Name)
+					if navigate && entry.Dir {
+						path = m.Selected
+						m.Query = ""
+					}
+					break
+				}
+			}
+			if m.Query != "" {
+				return m
+			}
+			continue
+		}
+		matches := matchingEntries(entries, parts[i], true)
+		if len(matches) == 0 {
+			m.Query = parts[i]
+			m.Err = fmt.Errorf("no directory matches %q", parts[i])
+			return m
+		}
+		path = filepath.Join(path, entries[matches[0]].Name)
+	}
+}
+
+func equalPath(a, b string) bool {
+	if filepath.Separator == '\\' {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+// Contiguous matches win over subsequences, with exact names first.
+func fuzzyMatch(name, query string) ([]int, int) {
+	n, q := []rune(name), []rune(query)
+	if len(q) == 0 {
+		return nil, 0
+	}
+	for i := range n {
+		n[i] = unicode.ToLower(n[i])
+	}
+	for i := range q {
+		q[i] = unicode.ToLower(q[i])
+	}
+	for start := 0; start+len(q) <= len(n); start++ {
+		if slices.Equal(n[start:start+len(q)], q) {
+			positions := make([]int, len(q))
+			for i := range q {
+				positions[i] = start + i
+			}
+			return positions, start*2 + len(n) - len(q)
+		}
+	}
+	var positions []int
+	for i, r := range n {
+		if r == q[len(positions)] {
+			positions = append(positions, i)
+		}
+		if len(positions) == len(q) {
+			return positions, 1000 + positions[len(positions)-1] - positions[0] + len(n)
+		}
+	}
+	return nil, -1
+}
+
+func matchingEntries(entries []Entry, query string, dirsOnly bool) []int {
+	if query == "" {
+		indices := make([]int, 0, len(entries))
+		for i, entry := range entries {
+			if !dirsOnly || entry.Dir {
+				indices = append(indices, i)
+			}
+		}
+		return indices
+	}
+	type match struct{ index, score int }
+	var matches []match
+	for i, entry := range entries {
+		if dirsOnly && !entry.Dir {
+			continue
+		}
+		_, score := fuzzyMatch(entry.Name, query)
+		if score >= 0 {
+			score++
+			if equalPath(entry.Name, query) {
+				score = 0
+			}
+			matches = append(matches, match{i, score})
+		}
+	}
+	slices.SortStableFunc(matches, func(a, b match) int { return a.score - b.score })
+	indices := make([]int, len(matches))
+	for i, match := range matches {
+		indices[i] = match.index
+	}
+	return indices
+}
+
+func (p *Picker) Apply(m DirectoryMsg) tea.Cmd {
+	if m.Generation != p.Generation || m.Input != p.Path.Value() {
+		return nil
 	}
 	p.Loading = false
 	if m.Err != nil {
 		p.Err = m.Err.Error()
+	}
+	if len(m.Columns) == 0 {
+		p.Columns, p.Dir, p.query, p.selected = nil, "", "", ""
+		return nil
+	}
+	dir := m.Columns[len(m.Columns)-1].Path
+	if dir != p.Dir {
+		if p.Dir != "" && !p.historyMove {
+			p.history = append(p.history, p.Dir)
+			p.future = nil
+		}
+		p.expanded = -1
+		p.bounds = nil
+	}
+	p.historyMove = false
+	for i := range m.Columns {
+		for _, old := range p.Columns {
+			if old.Path == m.Columns[i].Path {
+				m.Columns[i].Offset = old.Offset
+				break
+			}
+		}
+		if i+1 < len(m.Columns) {
+			child := filepath.Base(m.Columns[i+1].Path)
+			index := slices.IndexFunc(m.Columns[i].Entries, func(e Entry) bool { return e.Name == child })
+			m.Columns[i].Offset = max(0, index-p.Height/2)
+		}
+	}
+	p.Dir, p.Columns, p.query, p.selected = dir, m.Columns, m.Query, m.Selected
+	p.Cursor = 0
+	p.Columns[len(p.Columns)-1].Offset = 0
+	p.suggest()
+	if p.pendingAction != "" {
+		action := p.pendingAction
+		p.pendingAction = ""
+		if action == "tab" {
+			if completion := p.completion(); completion != "" {
+				return p.Navigate(completion)
+			}
+		} else if p.Enabled(action) {
+			return p.Action(action)
+		}
+	}
+	return p.CountVisible()
+}
+
+func (p Picker) completion() string {
+	if p.Loading || p.query == "" || len(p.Columns) == 0 {
+		return ""
+	}
+	col := p.Columns[len(p.Columns)-1]
+	matches := col.Matches
+	if len(matches) == 0 {
+		return ""
+	}
+	entry := col.Entries[matches[0]]
+	path := filepath.Join(col.Path, entry.Name)
+	if entry.Dir {
+		path = directoryPath(path)
+	}
+	return path
+}
+
+func (p *Picker) suggest() {
+	p.hint = ""
+	completion := p.completion()
+	if completion == "" || completion == p.Path.Value() {
 		return
 	}
-	if p.Dir != m.Path && p.Dir != "" {
-		p.history = append(p.history, p.Dir)
-	}
-	p.Dir = m.Path
-	p.Path.SetValue(m.Path)
-	p.Entries = m.Entries
-	p.Cursor = 0
-	p.Offset = 0
+	p.hint = "→ " + filepath.Base(filepath.Clean(completion))
 }
+
+func (p Picker) Enabled(id string) bool {
+	switch id {
+	case "pick-use":
+		return !p.Loading && p.Err == "" && p.selected != ""
+	case "pick-open":
+		return !p.Loading && strings.TrimSpace(p.Path.Value()) != "" && (p.Err != "" || p.Dir == "" || p.query != "" && p.completion() != p.Path.Value())
+	case "pick-up":
+		return p.Dir != "" && filepath.Dir(p.Dir) != p.Dir
+	case "pick-back":
+		return len(p.history) > 0
+	case "pick-forward":
+		return len(p.future) > 0
+	}
+	return true
+}
+
 func (p *Picker) Action(id string) tea.Cmd {
+	if !p.Enabled(id) {
+		return nil
+	}
 	switch id {
 	case "pick-up":
 		return p.Navigate(filepath.Dir(p.Dir))
 	case "pick-home":
-		h, _ := os.UserHomeDir()
+		h, err := os.UserHomeDir()
+		if err != nil {
+			p.Err = err.Error()
+			return nil
+		}
 		return p.Navigate(h)
 	case "pick-open":
+		if completion := p.completion(); completion != "" {
+			return p.Navigate(completion)
+		}
 		return p.Navigate(p.Path.Value())
 	case "pick-use":
-		dest := p.Dir
-		return func() tea.Msg { return PickedMsg{dest} }
+		dest, gen := p.selected, p.Generation
+		return func() tea.Msg { return PickedMsg{Path: dest, Generation: gen} }
 	case "pick-back":
-		if len(p.history) > 0 {
-			v := p.history[len(p.history)-1]
-			p.history = p.history[:len(p.history)-1]
-			p.future = append(p.future, p.Dir)
-			p.Dir = ""
-			return p.Navigate(v)
-		}
+		dest := p.history[len(p.history)-1]
+		p.history = p.history[:len(p.history)-1]
+		p.future = append(p.future, p.Dir)
+		p.historyMove = true
+		return p.Navigate(dest)
 	case "pick-forward":
-		if len(p.future) > 0 {
-			v := p.future[len(p.future)-1]
-			p.future = p.future[:len(p.future)-1]
-			return p.Navigate(v)
-		}
+		dest := p.future[len(p.future)-1]
+		p.future = p.future[:len(p.future)-1]
+		p.history = append(p.history, p.Dir)
+		p.historyMove = true
+		return p.Navigate(dest)
 	}
-	var n int
-	if _, e := fmt.Sscanf(id, "entry-%d", &n); e == nil && n >= 0 && n < len(p.Entries) {
-		return p.Navigate(filepath.Join(p.Dir, p.Entries[n].Name))
+	var col, row int
+	if _, err := fmt.Sscanf(id, "pick-entry-%d-%d", &col, &row); err == nil && col >= 0 && col < len(p.Columns) && row >= 0 && row < len(p.Columns[col].Entries) {
+		return p.Navigate(filepath.Join(p.Columns[col].Path, p.Columns[col].Entries[row].Name))
 	}
-	return nil
+	if _, err := fmt.Sscanf(id, "pick-column-%d", &col); err == nil && col >= 0 && col < len(p.Columns) {
+		p.expanded = col
+	}
+	return p.CountVisible()
 }
+
 func (p *Picker) Update(msg tea.Msg) tea.Cmd {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		switch k.String() {
-		case "up":
-			p.Cursor = max(0, p.Cursor-1)
-			p.Offset = min(p.Offset, p.Cursor)
-			return nil
-		case "down":
-			p.Cursor = min(max(0, len(p.Entries)-1), p.Cursor+1)
-			p.Offset = max(p.Offset, p.Cursor-p.Height+1)
-			return nil
+		case "up", "down":
+			if len(p.Columns) == 0 {
+				return nil
+			}
+			col := len(p.Columns) - 1
+			step := 1
+			if k.String() == "up" {
+				step = -1
+			}
+			p.Cursor = max(0, min(len(p.Columns[col].Matches)-1, p.Cursor+step))
+			p.Columns[col].Offset = min(p.Columns[col].Offset, p.Cursor)
+			p.Columns[col].Offset = max(p.Columns[col].Offset, p.Cursor-p.Height+1)
+			matches := p.Columns[col].Matches
+			if len(matches) > 0 {
+				p.selected = filepath.Join(p.Columns[col].Path, p.Columns[col].Entries[matches[p.Cursor]].Name)
+			}
+			return p.CountVisible()
 		case "alt+up":
 			return p.Action("pick-up")
-		case "ctrl+o":
-			return p.Action("pick-use")
-		case "enter":
-			return p.Navigate(p.Path.Value())
-		case "right":
-			if len(p.Entries) > 0 {
-				return p.Action(fmt.Sprintf("entry-%d", p.Cursor))
-			}
-		case "tab":
-			v := CleanPath(p.Path.Value())
-			return func() tea.Msg {
-				parent := filepath.Dir(v)
-				prefix := filepath.Base(v)
-				if strings.HasSuffix(v, string(filepath.Separator)) {
-					parent = v
-					prefix = ""
-				}
-				es, e := os.ReadDir(parent)
-				var matches []string
-				for _, entry := range es {
-					if strings.HasPrefix(strings.ToLower(entry.Name()), strings.ToLower(prefix)) && (entry.IsDir() || strings.EqualFold(filepath.Ext(entry.Name()), ".zip")) {
-						matches = append(matches, filepath.Join(parent, entry.Name()))
-					}
-				}
-				return CompletionMsg{v, matches, e}
-			}
 		case "alt+left":
 			return p.Action("pick-back")
 		case "alt+right":
 			return p.Action("pick-forward")
+		case "ctrl+o":
+			return p.Action("pick-use")
+		case "enter":
+			if p.Loading {
+				p.pendingAction = "pick-open"
+				return nil
+			}
+			return p.Action("pick-open")
+		case "tab":
+			if p.Loading {
+				p.pendingAction = "tab"
+				return nil
+			}
+			if completion := p.completion(); completion != "" {
+				return p.Navigate(completion)
+			}
+			return nil
+		case "alt+down":
+			if len(p.Columns) > 0 {
+				col := len(p.Columns) - 1
+				matches := p.Columns[col].Matches
+				if p.Cursor < len(matches) {
+					return p.Action(fmt.Sprintf("pick-entry-%d-%d", col, matches[p.Cursor]))
+				}
+			}
+			return nil
+		}
+		if k.Paste {
+			value := CleanPath(string(k.Runes))
+			if filepath.IsAbs(value) {
+				p.Path.SetValue(value)
+				p.Path.CursorEnd()
+				return p.resolve(false)
+			}
 		}
 	}
+	previous := p.Path.Value()
 	var cmd tea.Cmd
 	p.Path, cmd = p.Path.Update(msg)
+	if p.Path.Value() != previous {
+		return tea.Batch(cmd, p.resolve(false))
+	}
 	return cmd
 }
-func (p Picker) View(z *zone.Manager, w int, hover, focus string) string {
-	inner := w - 6
-	var b strings.Builder
-	b.WriteString(Title.Render("Choose a package") + "\n\n")
-	for _, v := range []struct{ id, label string }{{"pick-back", "‹ Back"}, {"pick-forward", "Forward ›"}, {"pick-up", "Up"}, {"pick-home", "Home"}, {"pick-open", "Go"}} {
-		b.WriteString(Button(z, v.id, v.label, hover, focus, false) + " ")
+
+func (p *Picker) CountVisible() tea.Cmd {
+	if p.Loading || p.ctx == nil || p.ctx.Err() != nil {
+		return nil
 	}
-	b.WriteString("\n\n")
-	input := p.Path
-	input.Width = max(10, inner-4)
-	input.Prompt = ""
-	inputStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(Border).Padding(0, 1).Width(inner - 2)
-	if hover == "pick-input" || focus == "pick-input" {
-		inputStyle = inputStyle.BorderForeground(Accent)
-	}
-	b.WriteString(z.Mark("pick-input", inputStyle.Render(input.View())) + "\n\n")
-	if p.Loading {
-		b.WriteString("Loading…\n")
-	} else if p.Err != "" {
-		b.WriteString(Warn.Render(Fit(p.Err, inner)) + "\n")
-	}
-	for i := p.Offset; i < min(len(p.Entries), p.Offset+p.Height); i++ {
-		v := p.Entries[i]
-		suffix := "/"
-		if !v.Dir {
-			suffix = fmt.Sprintf("  %.1f MB", float64(v.Size)/1e6)
+	var commands []tea.Cmd
+	for col := len(p.Columns) - 1; col >= 0 && len(p.pending) < 4; col-- {
+		if len(p.bounds) > 0 && !slices.ContainsFunc(p.bounds, func(b columnBounds) bool { return b.Index == col && b.Width >= 24 }) {
+			continue
 		}
-		label := Fit(v.Name+suffix, inner-2)
-		b.WriteString(Button(z, fmt.Sprintf("entry-%d", i), label, hover, focus, i == p.Cursor) + "\n")
+		column := p.Columns[col]
+		indices := column.Matches
+		for _, index := range indices[min(column.Offset, len(indices)):min(len(indices), column.Offset+p.Height)] {
+			entry := column.Entries[index]
+			path := filepath.Join(column.Path, entry.Name)
+			if _, done := p.counts[path]; done || !entry.Dir || p.pending[path] {
+				continue
+			}
+			if len(p.pending) == 4 {
+				break
+			}
+			p.pending[path] = true
+			ctx, gen := p.ctx, p.Generation
+			commands = append(commands, func() tea.Msg {
+				count, err := countDirectories(ctx, path)
+				return DirectoryCountMsg{Path: path, Count: count, Err: err, Generation: gen}
+			})
+		}
 	}
-	if len(p.Entries) == 0 && !p.Loading {
-		b.WriteString("No folders or ZIPs\n")
+	return tea.Batch(commands...)
+}
+
+func countDirectories(ctx context.Context, path string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	b.WriteString("\n" + Button(z, "pick-use", "Open folder", hover, focus, true) + "  " + Button(z, "pick-close", "Cancel", hover, focus, false))
-	return lipgloss.NewStyle().Width(w-2).Border(lipgloss.RoundedBorder()).BorderForeground(Border).Padding(1, 2).Render(b.String())
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	count := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return count, err
+		}
+		entries, err := f.ReadDir(128)
+		for _, entry := range entries {
+			if entry.IsDir() {
+				count++
+			}
+		}
+		if err == io.EOF {
+			return count, nil
+		}
+		if err != nil {
+			return count, err
+		}
+	}
+}
+
+func (p *Picker) ApplyCount(m DirectoryCountMsg) tea.Cmd {
+	if m.Generation != p.Generation {
+		return nil
+	}
+	delete(p.pending, m.Path)
+	if m.Err != nil {
+		p.counts[m.Path] = -1
+	} else {
+		p.counts[m.Path] = m.Count
+	}
+	return p.CountVisible()
 }
