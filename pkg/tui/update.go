@@ -174,10 +174,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.Hover = ""
-		for _, id := range m.Actions {
+		for _, id := range m.HoverOnly {
 			if m.Zones.Get(id).InBounds(v) {
 				m.Hover = id
 				break
+			}
+		}
+		if m.Hover == "" {
+			for _, id := range m.Actions {
+				if m.Zones.Get(id).InBounds(v) {
+					m.Hover = id
+					break
+				}
 			}
 		}
 		if m.Hover == "open-old" || m.Hover == "browse-old" {
@@ -210,7 +218,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft && m.Hover != "" {
+		if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft && slices.Contains(m.Actions, m.Hover) {
 			m.Focus = m.Hover
 			m.focusInput()
 			return m, m.action(m.Hover)

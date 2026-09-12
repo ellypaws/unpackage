@@ -77,6 +77,7 @@ type Model struct {
 	SharedBrowseDir                               string
 	Hover, Focus, Notice                          string
 	Actions                                       []string
+	HoverOnly                                     []string
 	Rows                                          []store.Row
 	Groups, Servers, Days                         []store.Group
 	Snapshots                                     []store.Snapshot

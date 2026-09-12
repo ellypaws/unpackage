@@ -61,6 +61,7 @@ func (m *Model) modal(body string) string {
 }
 func (m *Model) View() string {
 	m.Actions = nil
+	m.HoverOnly = nil
 	w := max(16, m.Width-4)
 	h := m.bodyHeight()
 	if m.Width < 64 || m.Height < 24 {
@@ -135,7 +136,7 @@ func (m *Model) View() string {
 		if r.Status == "missing" {
 			titleStyle = titleStyle.Foreground(components.Deleted)
 		}
-		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(store.LocalDate(r.Date)) + "\n\n" + components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render("Attachment  "+attachment+"\nServer      "+r.Guild+"\nChannel     "+r.Channel+"\nMessage     "+r.ID)
+		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + m.messageDate("detail-date", r.Date) + "\n\n" + components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render("Attachment  "+attachment+"\nServer      "+r.Guild+"\nChannel     "+r.Channel+"\nMessage     "+r.ID)
 		m.Viewport.SetContent(lipgloss.NewStyle().Width(w - 4).Render(content))
 		body = m.button("detail-close", "Back to results", false) + "\n\n" + m.Viewport.View()
 	} else {
@@ -232,6 +233,32 @@ func number(n int) string {
 		s = s[:i] + "," + s[i:]
 	}
 	return s
+}
+func relativeDate(date string, today time.Time) string {
+	messageTime, err := time.Parse(time.RFC3339Nano, date)
+	if err != nil {
+		return store.LocalDate(date)
+	}
+	messageTime = messageTime.In(time.Local)
+	today = today.In(time.Local)
+	messageDay := time.Date(messageTime.Year(), messageTime.Month(), messageTime.Day(), 0, 0, 0, 0, time.UTC)
+	todayDay := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	days := int(todayDay.Sub(messageDay) / (24 * time.Hour))
+	if days < 0 {
+		return fmt.Sprintf("in %s days", number(-days))
+	}
+	if days == 1 {
+		return "1 day ago"
+	}
+	return fmt.Sprintf("%s days ago", number(days))
+}
+func (m *Model) messageDate(id, date string) string {
+	label := relativeDate(date, m.Session.Today)
+	if m.Hover == id {
+		label = store.LocalDate(date)
+	}
+	m.HoverOnly = append(m.HoverOnly, id)
+	return m.Zones.Mark(id, lipgloss.NewStyle().Foreground(components.Muted).Render(label))
 }
 func displayChannel(r store.Row) string {
 	name := session.Safe(r.Name)
@@ -402,7 +429,7 @@ func (m *Model) messages(w, h int) string {
 		} else if r.HasAttachments {
 			media = ", attachment"
 		}
-		date := lipgloss.NewStyle().Foreground(components.Muted).Render(store.LocalDate(r.Date) + media)
+		date := m.messageDate(fmt.Sprintf("row-date-%d", i), r.Date) + lipgloss.NewStyle().Foreground(components.Muted).Render(media)
 		metaWidth := listWidth - 4
 		if action != "" {
 			metaWidth -= lipgloss.Width(action) + 1

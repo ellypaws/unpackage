@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -149,29 +150,64 @@ func Split(line string) ([]string, error) {
 }
 func Dates(text string, today time.Time) ([]string, error) {
 	var out []string
-	for v := range strings.SplitSeq(text, ";") {
-		v = strings.TrimSpace(v)
-		if _, e := time.Parse(time.DateOnly, v); e == nil {
-			out = append(out, v)
-			continue
+	for group := range strings.SplitSeq(text, ";") {
+		entries := []string{group}
+		if _, err := dateEntry(group, today); err != nil && strings.Contains(group, ",") {
+			entries = strings.Split(group, ",")
 		}
-		if strings.Contains(v, "-") {
-			return nil, fmt.Errorf("invalid date; use YYYY-MM-DD")
-		}
-		var b strings.Builder
-		for _, r := range v {
-			if r >= '0' && r <= '9' {
-				b.WriteRune(r)
+		for _, entry := range entries {
+			date, err := dateEntry(entry, today)
+			if err != nil {
+				return nil, err
 			}
+			out = append(out, date)
 		}
-		var n int
-		if b.Len() == 0 {
-			return nil, fmt.Errorf("enter a date or days ago")
-		}
-		if _, e := fmt.Sscan(b.String(), &n); e != nil || n > 100000 || n < 0 {
-			return nil, fmt.Errorf("days must be between 0 and 100000")
-		}
-		out = append(out, today.AddDate(0, 0, -n).Format(time.DateOnly))
 	}
 	return out, nil
+}
+
+func dateEntry(text string, today time.Time) (string, error) {
+	text = strings.TrimSpace(text)
+	if _, err := time.Parse(time.DateOnly, text); err == nil {
+		return text, nil
+	}
+	if strings.Contains(text, "-") {
+		return "", fmt.Errorf("invalid date; use YYYY-MM-DD")
+	}
+
+	value := strings.ToLower(text)
+	value = strings.TrimSpace(strings.TrimSuffix(value, "ago"))
+	if withoutDays, ok := strings.CutSuffix(value, "days"); ok {
+		value = strings.TrimSpace(withoutDays)
+	} else if withoutDay, ok := strings.CutSuffix(value, "day"); ok {
+		value = strings.TrimSpace(withoutDay)
+	}
+	if value == "" {
+		return "", fmt.Errorf("enter a date or days ago")
+	}
+	groups := strings.Split(value, ",")
+	if len(groups) > 1 {
+		if len(groups[0]) < 1 || len(groups[0]) > 3 {
+			return "", fmt.Errorf("enter a date or days ago")
+		}
+		for _, group := range groups {
+			if group != strings.TrimSpace(group) || strings.Trim(group, "0123456789") != "" {
+				return "", fmt.Errorf("enter a date or days ago")
+			}
+		}
+		for _, group := range groups[1:] {
+			if len(group) != 3 {
+				return "", fmt.Errorf("enter a date or days ago")
+			}
+		}
+	}
+	value = strings.ReplaceAll(value, ",", "")
+	if strings.Trim(value, "0123456789") != "" {
+		return "", fmt.Errorf("enter a date or days ago")
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n > 100000 {
+		return "", fmt.Errorf("days must be between 0 and 100000")
+	}
+	return today.AddDate(0, 0, -n).Format(time.DateOnly), nil
 }
