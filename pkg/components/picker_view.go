@@ -107,11 +107,12 @@ func (p *Picker) Mouse(msg tea.MouseMsg) (string, tea.Cmd) {
 	return "", nil
 }
 
-func (p *Picker) View(z *zone.Manager, width int, hover, focus string) string {
+func (p *Picker) View(z *zone.Manager, width int, hover, focus string, frame int) string {
 	inner := width - 6
 	p.Actions = nil
 	var b strings.Builder
-	b.WriteString(Title.Render("Choose a package") + "\n\n")
+	busy := p.Loading || len(p.pending) > 0
+	b.WriteByte('\n')
 	for _, v := range []struct{ id, label string }{{"pick-back", "‹ Back"}, {"pick-forward", "Forward ›"}, {"pick-up", "Up"}, {"pick-home", "Home"}} {
 		b.WriteString(p.button(z, v.id, v.label, hover, focus, false) + " ")
 	}
@@ -121,17 +122,19 @@ func (p *Picker) View(z *zone.Manager, width int, hover, focus string) string {
 	b.WriteString(InputField(z, "pick-input", &p.Path, inner, hover, focus, action, p.hint) + "\n")
 	status := ""
 	if p.Loading {
-		status = "Loading…"
+		status = Working("Reading folders and packages…", frame, inner)
+	} else if len(p.pending) > 0 {
+		status = Working(fmt.Sprintf("Inspecting %d folders…", len(p.pending)), frame, inner)
 	} else if p.Err != "" {
-		status = p.Err
+		status = lipgloss.NewStyle().Foreground(Deleted).Render(Fit(p.Err, inner))
 	}
-	b.WriteString(MutedStyle.Render(Fit(status, inner)) + "\n")
+	b.WriteString(status + "\n")
 	p.bounds = p.columnWidths(inner)
 	var columns []string
 	for i := range p.bounds {
 		bound := &p.bounds[i]
-		bound.Y = 2 + strings.Count(b.String(), "\n")
-		columns = append(columns, p.columnView(z, *bound, hover, focus))
+		bound.Y = 1 + strings.Count(b.String(), "\n")
+		columns = append(columns, p.columnView(z, *bound, hover, focus, frame))
 	}
 	if len(columns) == 0 {
 		b.WriteString(strings.Repeat("\n", p.Height))
@@ -143,18 +146,18 @@ func (p *Picker) View(z *zone.Manager, width int, hover, focus string) string {
 		name = filepath.Base(p.Dir)
 	}
 	label := "Choose this package (" + Fit(name, max(1, inner-35)) + ")"
-	b.WriteString("\n\n" + p.button(z, "pick-use", label, hover, focus, true) + " " + p.button(z, "pick-close", "Cancel", hover, focus, false))
-	return lipgloss.NewStyle().Width(width-2).Border(lipgloss.RoundedBorder()).BorderForeground(Border).Padding(1, 2).Render(b.String())
+	b.WriteString("\n\n" + p.button(z, "pick-use", label, hover, focus, true) + " " + p.button(z, "pick-close", "Cancel", hover, focus, false) + "\n")
+	return TitledBox("Choose a package", b.String(), width, 2, lipgloss.RoundedBorder(), GradientColor(.46), frame, busy)
 }
 
-func (p *Picker) columnView(z *zone.Manager, bound columnBounds, hover, focus string) string {
+func (p *Picker) columnView(z *zone.Manager, bound columnBounds, hover, focus string, frame int) string {
 	col, width := bound.Index, bound.Width
 	column := p.Columns[col]
 	last := col == len(p.Columns)-1
 	color := Text
 	if !last && col != p.expanded {
 		age := min(5, len(p.Columns)-1-col)
-		color = lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", 190-age*19, 186-age*19, 205-age*19))
+		color = Fade(Text, age)
 	}
 	style := lipgloss.NewStyle().Foreground(color)
 	name := filepath.Base(column.Path)
@@ -187,11 +190,19 @@ func (p *Picker) columnView(z *zone.Manager, bound columnBounds, hover, focus st
 				rowStyle = rowStyle.Foreground(Accent).Bold(true).Background(Surface)
 			}
 			if hover == id || focus == id {
-				rowStyle = rowStyle.Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#37445E")).Underline(true)
+				rowStyle = rowStyle.Foreground(Brightness(Saturation(GradientColor(.64), .04), .08)).Background(SurfaceHover).Underline(true)
 			}
 			meta := ""
+			metaStyle := MutedStyle
 			if entry.Dir {
-				if count, ok := p.counts[filepath.Join(column.Path, entry.Name)]; ok && count > 0 {
+				path := filepath.Join(column.Path, entry.Name)
+				if p.pending[path] {
+					meta = Spinner(frame)
+					metaStyle = lipgloss.NewStyle()
+				} else if p.packages[path] {
+					meta = "Package"
+					metaStyle = lipgloss.NewStyle().Foreground(Accent).Bold(true)
+				} else if count, ok := p.counts[path]; ok && count > 0 {
 					meta = fmt.Sprintf("+%d", count)
 				}
 			} else {
@@ -215,7 +226,7 @@ func (p *Picker) columnView(z *zone.Manager, bound columnBounds, hover, focus st
 			}
 			line = fuzzyHighlight(label, query, rowStyle)
 			gap := max(0, width-1-lipgloss.Width(line)-lipgloss.Width(meta))
-			line += rowStyle.Render(strings.Repeat(" ", gap)) + MutedStyle.Render(meta)
+			line += rowStyle.Render(strings.Repeat(" ", gap)) + metaStyle.Render(meta)
 			if width >= 16 {
 				p.Actions = append(p.Actions, id)
 				line = z.Mark(id, line)
@@ -229,7 +240,9 @@ func (p *Picker) columnView(z *zone.Manager, bound columnBounds, hover, focus st
 		}
 		lines = append(lines, lipgloss.NewStyle().Width(width-1).Render(line))
 	}
-	return lipgloss.NewStyle().BorderRight(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(Border).Render(strings.Join(lines, "\n"))
+	position := float64(col) / float64(max(1, len(p.Columns)-1))
+	border := Brightness(Saturation(GradientColor(position), -.14), -.44)
+	return lipgloss.NewStyle().BorderRight(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(border).Render(strings.Join(lines, "\n"))
 }
 
 func fuzzyHighlight(label, query string, style lipgloss.Style) string {

@@ -57,6 +57,7 @@ package repl
 package sample DIRECTORY [MESSAGE_COUNT]
 
 Dates use local time. Quote paths with spaces.
+Use Read from clipboard in Investigate to filter exact incident seconds.
 Request requires selected server IDs; all ignores other filters.
 Missing means absent from the newer export, not proof of deletion.`
 
@@ -162,12 +163,14 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 	case "dates":
 		if arg == "clear" {
 			s.Filter.Dates = nil
+			s.Filter.IncidentSeconds = nil
 		} else {
 			d, e := Dates(arg, s.Today)
 			if e != nil {
 				return e
 			}
 			s.Filter.Dates = d
+			s.Filter.IncidentSeconds = nil
 		}
 		s.Filter.From = ""
 		s.Filter.Until = ""
@@ -178,6 +181,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 			return fmt.Errorf("last requires 1 to 100000 days")
 		}
 		s.Filter.Dates = nil
+		s.Filter.IncidentSeconds = nil
 		s.Filter.From = s.Today.AddDate(0, 0, 1-n).Format(time.DateOnly)
 		s.Filter.Until = s.Today.AddDate(0, 0, 1).Format(time.DateOnly)
 	case "margin":
@@ -199,6 +203,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 			return e
 		}
 		s.Filter.Dates = nil
+		s.Filter.IncidentSeconds = nil
 		s.Filter.From = ""
 		s.Filter.Until = arg
 	case "search":

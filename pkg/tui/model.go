@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/muesli/termenv"
 
 	"github.com/ellypaws/unpackage/pkg/components"
 	"github.com/ellypaws/unpackage/pkg/session"
@@ -23,6 +25,13 @@ type searchMsg struct {
 	Server   bool
 	Revision int
 	Value    string
+}
+type incidentInputMsg struct {
+	Seconds    []int64
+	Recognized bool
+	Clipboard  bool
+	Err        error
+	Revision   int
 }
 
 const (
@@ -58,6 +67,7 @@ type Model struct {
 	ctx                                           context.Context
 	Zones                                         *zone.Manager
 	Width, Height, Tab, Cursor, Offset, Revision  int
+	Frame                                         int
 	Input                                         textinput.Model
 	ServerInput                                   textinput.Model
 	ServerSearch                                  string
@@ -95,11 +105,15 @@ type Model struct {
 	DropBuffer                                    string
 	DropInput, DropFocus                          string
 	DropTime                                      time.Time
-	DropRevision                                  int
+	DropRevision, IncidentInputRevision           int
+	IncidentProcessing                            string
 	LastCommand                                   string
 }
 
 func New(ctx context.Context, s *session.Session) *Model {
+	if os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb" {
+		lipgloss.SetColorProfile(termenv.TrueColor)
+	}
 	input := textinput.New()
 	input.Prompt = "› "
 	input.Placeholder = "Command…"
@@ -135,9 +149,13 @@ func New(ctx context.Context, s *session.Session) *Model {
 	after.CharLimit = 4
 	return &Model{Session: s, ctx: ctx, Zones: zone.New(), Width: 90, Height: 28, Input: input, ServerInput: serverInput, DayInput: days, SearchInput: search, RequestInput: request, BeforeInput: before, AfterInput: after, PackagesExpanded: true, Viewport: viewport.New(80, 15), Focus: "open-old", RequestScope: "all", FollowLog: true, ConsoleFollow: true}
 }
-func (m *Model) Init() tea.Cmd { return tea.Batch(textinput.Blink, tick(), m.refresh()) }
-func tick() tea.Cmd {
-	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+func (m *Model) Init() tea.Cmd { return tea.Batch(textinput.Blink, tick(false), m.refresh()) }
+func tick(active bool) tea.Cmd {
+	interval := 250 * time.Millisecond
+	if active {
+		interval = 120 * time.Millisecond
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 func (m *Model) refresh() tea.Cmd {
 	if m.Loading || m.Executing {
@@ -147,6 +165,7 @@ func (m *Model) refresh() tea.Cmd {
 	f := m.Session.Filter
 	f.Guilds = slices.Clone(f.Guilds)
 	f.Dates = slices.Clone(f.Dates)
+	f.IncidentSeconds = slices.Clone(f.IncidentSeconds)
 	f.Limit = m.pageSize()
 	f.Offset = m.Offset
 	revision := m.Revision
@@ -162,7 +181,7 @@ func (m *Model) refresh() tea.Cmd {
 		full := f
 		full.Limit = 0
 		full.Offset = 0
-		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
+		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), IncidentSeconds: slices.Clone(full.IncidentSeconds), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
 		var filtered, matching []store.Row
 		var errs [3]error
 		var group sync.WaitGroup
@@ -192,7 +211,7 @@ func (m *Model) refresh() tea.Cmd {
 		for i := range d.Servers {
 			d.Servers[i].Count = counts[d.Servers[i].ID]
 		}
-		if len(full.Dates) > 0 || full.From != "" || full.Until != "" {
+		if len(full.Dates) > 0 || len(full.IncidentSeconds) > 0 || full.From != "" || full.Until != "" {
 			d.Servers = slices.DeleteFunc(d.Servers, func(group store.Group) bool { return group.Count == 0 })
 		}
 		return d

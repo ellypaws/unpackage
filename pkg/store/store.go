@@ -21,6 +21,7 @@ type Store struct {
 }
 type Message struct {
 	ID, Channel, Date, Content string
+	AttachmentURLs             []string
 	HasAttachments, HasMedia   bool
 }
 type ChannelObservation struct {
@@ -28,17 +29,18 @@ type ChannelObservation struct {
 	Rank                          int
 }
 type Row struct {
-	ID             string `json:"message_id"`
-	Channel        string `json:"channel_id"`
-	Date           string `json:"date"`
-	Content        string `json:"content"`
-	Guild          string `json:"server_id"`
-	Server         string `json:"server"`
-	Name           string `json:"channel"`
-	Kind           string `json:"kind"`
-	Status         string `json:"status"`
-	HasAttachments bool   `json:"has_attachments"`
-	HasMedia       bool   `json:"has_media"`
+	ID             string   `json:"message_id"`
+	Channel        string   `json:"channel_id"`
+	Date           string   `json:"date"`
+	Content        string   `json:"content"`
+	Guild          string   `json:"server_id"`
+	Server         string   `json:"server"`
+	Name           string   `json:"channel"`
+	Kind           string   `json:"kind"`
+	Status         string   `json:"status"`
+	HasAttachments bool     `json:"has_attachments"`
+	HasMedia       bool     `json:"has_media"`
+	AttachmentURLs []string `json:"-"`
 }
 type Group struct {
 	ID, Name string
@@ -47,6 +49,7 @@ type Group struct {
 type Filter struct {
 	Mode, Search, Channel, Kind, Media string
 	Guilds, Dates                      []string
+	IncidentSeconds                    []int64
 	From, Until                        string
 	Limit, Offset                      int
 	DateBefore, DateAfter              int
@@ -297,6 +300,15 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		}
 		windows = append(windows, [2]string{t.AddDate(0, 0, -f.DateBefore).Format(time.DateOnly), t.AddDate(0, 0, f.DateAfter).Format(time.DateOnly)})
 	}
+	incidentSeconds := make(map[int64]bool, len(f.IncidentSeconds))
+	incidentDays := make(map[string]bool, len(f.IncidentSeconds))
+	for _, second := range f.IncidentSeconds {
+		if second <= 0 {
+			return nil, fmt.Errorf("invalid incident time")
+		}
+		incidentSeconds[second] = true
+		incidentDays[time.Unix(second, 0).In(time.Local).Format(time.DateOnly)] = true
+	}
 	s.mu.RLock()
 	a, b := s.snapshots[0], s.snapshots[1]
 	ok, why := compatible(a, b)
@@ -335,13 +347,16 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			continue
 		}
 		candidates := maps.Values(ms)
-		if len(windows) > 0 || f.From != "" || f.Until != "" {
+		if len(windows) > 0 || f.From != "" || f.Until != "" || len(incidentSeconds) > 0 {
 			candidates = func(yield func(Message) bool) {
 				for day, ids := range s.byDate[slot] {
 					if ctx.Err() != nil {
 						return
 					}
 					if f.From != "" && day < f.From || f.Until != "" && day >= f.Until {
+						continue
+					}
+					if len(incidentDays) > 0 && !incidentDays[day] {
 						continue
 					}
 					if len(windows) > 0 && !slices.ContainsFunc(windows, func(w [2]string) bool { return day >= w[0] && day <= w[1] }) {
@@ -360,6 +375,12 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				if e := ctx.Err(); e != nil {
 					s.mu.RUnlock()
 					return nil, e
+				}
+			}
+			if len(incidentSeconds) > 0 {
+				created, err := time.Parse(time.RFC3339Nano, m.Date)
+				if err != nil || !incidentSeconds[created.Unix()] {
+					continue
 				}
 			}
 			_, inOld := s.messages[0][m.ID]
@@ -413,7 +434,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		} else if mode == "present" || mode == "new" {
 			status = mode
 		}
-		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: cmp.Or(c.name, m.Channel), Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia})
+		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: cmp.Or(c.name, m.Channel), Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs)})
 	}
 	slices.SortFunc(rows, func(a, b Row) int {
 		return cmp.Or(strings.Compare(a.Date, b.Date), cmp.Compare(len(a.ID), len(b.ID)), strings.Compare(a.ID, b.ID))

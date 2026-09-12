@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -89,6 +91,8 @@ func digits(v string) bool {
 
 var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true}
 
+const attachmentURLsKey = "attachment_urls"
+
 func attachmentPresent(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	return value != "" && value != "[]" && value != "null" && value != "none"
@@ -107,6 +111,24 @@ func attachmentMedia(values ...string) bool {
 		}
 	}
 	return false
+}
+
+func attachmentURLs(values ...string) []string {
+	var urls []string
+	for _, value := range values {
+		for field := range strings.FieldsSeq(value) {
+			parsed, err := url.Parse(field)
+			if err != nil || parsed.Host == "" || parsed.Scheme != "https" && parsed.Scheme != "http" || slices.Contains(urls, field) {
+				continue
+			}
+			urls = append(urls, field)
+		}
+	}
+	return urls
+}
+
+func mergeAttachmentURLs(current string, values ...string) string {
+	return strings.Join(attachmentURLs(append([]string{current}, values...)...), "\n")
 }
 
 func walk(d *json.Decoder, depth int, object func(map[string]string) error, field func(string, string) error) (map[string]string, error) {
@@ -149,6 +171,7 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 				}
 				if key == "attachments" && attachmentPresent(v) {
 					out["has_attachments"] = "1"
+					out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], v)
 					if attachmentMedia(v) {
 						out["has_media"] = "1"
 					}
@@ -160,6 +183,7 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 				if child["has_media"] == "1" {
 					out["has_media"] = "1"
 				}
+				out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], child[attachmentURLsKey])
 			} else if key == "properties" || key == "data" {
 				for k, v := range child {
 					if out[k] == "" {
@@ -193,6 +217,7 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 			}
 			if value, ok := child["$"]; ok && attachmentPresent(value) {
 				out["has_attachments"] = "1"
+				out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], value)
 				if attachmentMedia(value) {
 					out["has_media"] = "1"
 				}
@@ -200,6 +225,7 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 			if child["has_media"] == "1" {
 				out["has_media"] = "1"
 			}
+			out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], child["url"], child[attachmentURLsKey])
 		}
 		if _, e = d.Token(); e != nil {
 			return nil, e

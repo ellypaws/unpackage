@@ -18,11 +18,13 @@ func (m *Model) enabled(id string) bool {
 	switch id {
 	case "days-apply":
 		dates, err := session.Dates(m.DayInput.Value(), m.Session.Today)
-		return err == nil && (f.From != "" || f.Until != "" || slices.ContainsFunc(dates, func(day string) bool { return !slices.Contains(f.Dates, day) }))
+		return err == nil && (len(f.IncidentSeconds) > 0 || f.From != "" || f.Until != "" || slices.ContainsFunc(dates, func(day string) bool { return !slices.Contains(f.Dates, day) }))
 	case "dates-clear":
-		return len(f.Dates) > 0 || f.From != "" || f.Until != ""
+		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || f.From != "" || f.Until != ""
+	case "clipboard":
+		return m.IncidentProcessing == ""
 	case "clear":
-		return len(f.Dates) > 0 || len(f.Guilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
+		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
 	case "previous":
 		return m.Offset > 0 && !m.Loading
 	case "next":
@@ -44,6 +46,9 @@ func (m *Model) enabled(id string) bool {
 	case "draft":
 		return len(f.Guilds) > 0
 	case "margin-apply":
+		if len(f.IncidentSeconds) > 0 {
+			return false
+		}
 		before, beforeErr := session.Margin(m.BeforeInput.Value())
 		after, afterErr := session.Margin(m.AfterInput.Value())
 		return beforeErr == nil && afterErr == nil && (before != f.DateBefore || after != f.DateAfter)
@@ -52,7 +57,7 @@ func (m *Model) enabled(id string) bool {
 	case "cal-clear":
 		return m.Calendar != nil && len(m.Calendar.Dates) > 0
 	case "cal-apply":
-		return m.Calendar != nil && (!slices.Equal(m.Calendar.Dates, f.Dates) || f.From != "" || f.Until != "")
+		return m.Calendar != nil && (len(f.IncidentSeconds) > 0 || !slices.Equal(m.Calendar.Dates, f.Dates) || f.From != "" || f.Until != "")
 	case "stop":
 		return m.Session.Busy()
 	case "log-follow":

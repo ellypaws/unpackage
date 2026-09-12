@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/76creates/stickers/flexbox"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/ellypaws/unpackage/pkg/components"
 	"github.com/ellypaws/unpackage/pkg/session"
@@ -55,9 +57,78 @@ func (m *Model) field(id string, input *textinput.Model, w int) string {
 	m.Actions = append(m.Actions, id)
 	return components.InputField(m.Zones, id, input, w, m.Hover, m.Focus, action, "")
 }
-func (m *Model) modal(body string) string {
-	panel := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(components.Accent).Padding(1, 2).Render(body)
+func (m *Model) modal(title, body string) string {
+	border := components.GradientColor(.62)
+	if m.workLabel() != "" {
+		border = components.Brightness(border, .06)
+	}
+	width := min(m.Width-2, max(lipgloss.Width(body)+6, lipgloss.Width(title)+7))
+	panel := components.TitledBox(title, body, width, 2, lipgloss.RoundedBorder(), border, m.Frame, m.workLabel() != "")
 	return m.Zones.Scan(lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, panel))
+}
+
+func (m *Model) workLabel() string {
+	if m.Picker != nil && m.Picker.Busy() {
+		return "Inspecting folders and packages…"
+	}
+	if m.IncidentProcessing != "" {
+		return m.IncidentProcessing
+	}
+	if m.ServerDialog && m.ServerInput.Value() != m.ServerSearch {
+		return "Searching servers…"
+	}
+	if m.Tab == tabInvestigate && (m.SearchInput.Value() != m.Session.Filter.Search || m.Loading && m.Session.Filter.Search != "") {
+		if len(m.Session.Filter.IncidentSeconds) > 0 {
+			return "Finding messages at exact times…"
+		}
+		return "Searching messages…"
+	}
+	if m.Session.Busy() {
+		return "Importing packages…"
+	}
+	if m.Executing {
+		switch m.LastCommand {
+		case "request":
+			return "Saving deletion request…"
+		case "remove":
+			return "Clearing package…"
+		case "wait":
+			return "Waiting for imports…"
+		default:
+			return "Running " + m.LastCommand + "…"
+		}
+	}
+	if m.Loading {
+		return "Refreshing results…"
+	}
+	return ""
+}
+
+func (m *Model) statusLine(width int) string {
+	if label := m.workLabel(); label != "" {
+		return components.Working(label, m.Frame, width)
+	}
+	if m.Warning != "" && m.Warning != "Comparison pending" {
+		return components.Warn.Render(components.Fit(m.Warning, width))
+	}
+	text := strings.TrimSpace(m.Notice)
+	if text == "" || text == "Done" {
+		return ""
+	}
+	style := lipgloss.NewStyle().Foreground(components.Accent)
+	lower := strings.ToLower(text)
+	if strings.HasPrefix(lower, "applied ") || strings.HasPrefix(lower, "saved ") {
+		style = style.Foreground(components.Green).Bold(true)
+	} else if strings.Contains(lower, "invalid") || strings.Contains(lower, "error") || strings.Contains(lower, "cannot") || strings.Contains(lower, "has no ") || strings.Contains(lower, "exceeds") {
+		style = style.Foreground(components.Deleted)
+	} else if strings.HasPrefix(lower, "stopping") || strings.HasPrefix(lower, "choose ") {
+		style = components.Warn
+	}
+	return style.Render(components.Fit(text, width))
+}
+
+func (m *Model) appTitle(width int) string {
+	return components.TitleRule("Find missing messages", width, m.Frame, m.workLabel() != "")
 }
 func (m *Model) View() string {
 	m.Actions = nil
@@ -65,12 +136,12 @@ func (m *Model) View() string {
 	w := max(16, m.Width-4)
 	h := m.bodyHeight()
 	if m.Width < 64 || m.Height < 24 {
-		return components.Title.Render("Find missing messages") + "\nResize to at least 64 × 24."
+		return components.Gradient("Find missing messages") + "\n" + components.Warn.Render("Resize to at least 64 × 24.")
 	}
 	if m.Picker != nil {
 		m.Picker.Height = max(1, m.Height-17)
-		heading := components.Title.Render([]string{"Older package", "Newer package"}[m.PickSlot])
-		body := m.Picker.View(m.Zones, w, m.Hover, m.Focus)
+		heading := components.TitleRule([]string{"Older package", "Newer package"}[m.PickSlot], w, m.Frame, m.Picker.Busy())
+		body := m.Picker.View(m.Zones, w, m.Hover, m.Focus, m.Frame)
 		m.Actions = m.Picker.Actions
 		return m.Zones.Scan(lipgloss.NewStyle().Padding(0, 2).Render(heading + "\n" + body))
 	}
@@ -80,26 +151,30 @@ func (m *Model) View() string {
 		for d := 1; d <= m.Calendar.Month.AddDate(0, 1, -1).Day(); d++ {
 			m.Actions = append(m.Actions, "date-"+m.Calendar.Month.AddDate(0, 0, d-1).Format(time.DateOnly))
 		}
-		return m.modal(m.Calendar.View(m.Zones, m.Hover, m.Focus, m.enabled("cal-apply")))
+		return m.modal("Dates", m.Calendar.View(m.Zones, m.Hover, m.Focus, m.enabled("cal-apply")))
 	}
 	if m.MarginDialog {
 		before := "Days before\n" + m.field("margin-before", &m.BeforeInput, 10)
 		after := "Days after\n" + m.field("margin-after", &m.AfterInput, 10)
-		body := components.Title.Render("Around each selected date") + "\n\n" + lipgloss.JoinHorizontal(lipgloss.Top, before, "  ", after) + "\n" + m.button("margin-apply", "Apply", true) + " " + m.button("margin-clear", "Exact day", false) + " " + m.button("margin-close", "Cancel", false)
-		if m.Notice != "" && m.Notice != "Done" {
-			body += "\n\n" + components.Fit(m.Notice, 44)
+		body := lipgloss.JoinHorizontal(lipgloss.Top, before, "  ", after) + "\n" + m.button("margin-apply", "Apply", true) + " " + m.button("margin-clear", "Exact day", false) + " " + m.button("margin-close", "Cancel", false)
+		if status := m.statusLine(44); status != "" {
+			body += "\n\n" + status
 		}
-		return m.modal(body)
+		return m.modal("Around each selected date", body)
 	}
 	if m.ServerDialog {
-		return m.modal(m.servers())
+		return m.modal("Servers", m.servers())
 	}
 	if m.FilterDialog {
 		body := m.filters(34)
 		if len(m.Session.Filter.Guilds) > 0 {
 			body += "\n\n" + m.button("draft", "Deletion request", false)
 		}
-		return m.modal(body + "\n" + m.button("filters-close", "Done", true))
+		body += "\n" + m.button("filters-close", "Done", true)
+		if status := m.statusLine(34); status != "" {
+			body += "\n\n" + status
+		}
+		return m.modal("Filters", body)
 	}
 	if m.RequestDialog {
 		width := min(w-6, 70)
@@ -107,11 +182,11 @@ func (m *Model) View() string {
 		if m.RequestScope == "filtered" {
 			scope = "Current matching messages"
 		}
-		body := components.Title.Render("Deletion request") + "\n\n" + fmt.Sprintf("%d servers selected", len(m.Session.Filter.Guilds)) + "\n\n" + m.button("scope", scope, false) + "\n\n" + m.field("request-path", &m.RequestInput, width) + "\n\n" + m.button("request-close", "Cancel", false)
-		if m.Notice != "" && m.Notice != "Done" {
-			body += "\n\n" + components.Fit(m.Notice, width)
+		body := fmt.Sprintf("%d servers selected", len(m.Session.Filter.Guilds)) + "\n\n" + m.button("scope", scope, false) + "\n\n" + m.field("request-path", &m.RequestInput, width) + "\n\n" + m.button("request-close", "Cancel", false)
+		if status := m.statusLine(width); status != "" {
+			body += "\n\n" + status
 		}
-		return m.modal(body)
+		return m.modal("Deletion request", body)
 	}
 	var tabs []string
 	for i, name := range []string{"Investigate", "Console", "Log"} {
@@ -120,23 +195,40 @@ func (m *Model) View() string {
 		tabs = append(tabs, components.Tab(m.Zones, id, name, m.Hover, m.Focus, m.Tab == i, 2))
 	}
 	tabRow := lipgloss.JoinHorizontal(lipgloss.Bottom, tabs...)
-	tabRow += lipgloss.NewStyle().Foreground(components.Border).Render(strings.Repeat("─", max(0, w-lipgloss.Width(tabRow))))
+	tabRow += components.Separator(max(0, w-lipgloss.Width(tabRow)))
 	var body string
 	if m.Detail != nil {
 		r := m.Detail
 		m.Viewport.Width = w - 4
 		m.Viewport.Height = h - 3
-		attachment := "None"
-		if r.HasMedia {
-			attachment = "Image, video or audio"
-		} else if r.HasAttachments {
-			attachment = "Attachment"
-		}
 		titleStyle := components.Title
 		if r.Status == "missing" {
 			titleStyle = titleStyle.Foreground(components.Deleted)
 		}
-		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + m.messageDate("detail-date", r.Date) + "\n\n" + components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text)) + "\n\n" + lipgloss.NewStyle().Foreground(components.Muted).Render("Attachment  "+attachment+"\nServer      "+r.Guild+"\nChannel     "+r.Channel+"\nMessage     "+r.ID)
+		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text))
+		if strings.TrimSpace(r.Content) == "" {
+			messageContent = lipgloss.NewStyle().Foreground(components.Muted).Render("No text content")
+		}
+		attachments := lipgloss.NewStyle().Foreground(components.Muted).Render("None")
+		if len(r.AttachmentURLs) > 0 {
+			lines := make([]string, 0, len(r.AttachmentURLs))
+			for _, attachmentURL := range r.AttachmentURLs {
+				lines = append(lines, ansi.Hardwrap(session.Safe(attachmentURL), max(20, w-4), false))
+			}
+			attachments = lipgloss.NewStyle().Foreground(components.Text).Render(strings.Join(lines, "\n"))
+		} else if r.HasAttachments {
+			attachments = lipgloss.NewStyle().Foreground(components.Muted).Render("URL unavailable in this export")
+		}
+		attachmentKind := "None"
+		if r.HasMedia {
+			attachmentKind = "Image, video or audio"
+		} else if r.HasAttachments {
+			attachmentKind = "Attachment"
+		}
+		dateDetails := lipgloss.NewStyle().Foreground(components.Muted).Render("Date        " + fullDateTime(r.Date) + "\nAge         " + relativeDate(r.Date, m.Session.Today) + "\nElapsed     " + calendarAge(r.Date, m.Session.Today))
+		metadata := lipgloss.NewStyle().Foreground(components.Muted).Render("Status      " + r.Status + "\nAttachment  " + attachmentKind + "\nServer ID   " + r.Guild + "\nChannel ID  " + r.Channel + "\nMessage ID  " + r.ID)
+		contentWidth := max(1, w-4)
+		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + dateDetails + "\n\n" + components.TitleRule("Message content", contentWidth, m.Frame, false) + "\n" + messageContent + "\n\n" + components.TitleRule("Attachments", contentWidth, m.Frame, false) + "\n" + attachments + "\n\n" + metadata
 		m.Viewport.SetContent(lipgloss.NewStyle().Width(w - 4).Render(content))
 		body = m.button("detail-close", "Back to results", false) + "\n\n" + m.Viewport.View()
 	} else {
@@ -148,7 +240,16 @@ func (m *Model) View() string {
 		case tabLog:
 			lines := m.Session.Log.Lines()
 			for i, v := range lines {
-				lines[i] = session.Safe(v)
+				line := session.Safe(v)
+				switch {
+				case strings.Contains(line, "level=ERROR"):
+					line = lipgloss.NewStyle().Foreground(components.Deleted).Render(line)
+				case strings.Contains(line, "level=WARN"):
+					line = components.Warn.Render(line)
+				case strings.Contains(line, "level=INFO"):
+					line = lipgloss.NewStyle().Foreground(components.Cyan).Render(line)
+				}
+				lines[i] = line
 			}
 			m.Viewport.Width = w - 4
 			m.Viewport.Height = h - 3
@@ -159,26 +260,11 @@ func (m *Model) View() string {
 			body = m.button("log-follow", "Follow latest", m.FollowLog) + "\n\n" + m.Viewport.View()
 		}
 	}
-	state := m.Notice
-	if m.Executing {
-		state = "Working…"
-	} else if m.Session.Busy() {
-		state = "Loading…"
-	}
-	if m.Tab == tabInvestigate && (m.SearchInput.Value() != m.Session.Filter.Search || m.Loading && m.Session.Filter.Search != "") {
-		state = "Searching…"
-	}
-	if state == "Done" {
-		state = ""
-	}
-	if m.Warning != "" && m.Warning != "Comparison pending" {
-		state = m.Warning
-	}
-	footer := components.Fit(state, w)
+	footer := m.statusLine(w)
 	if m.Tab == tabConsole {
 		footer = m.field("command", &m.Input, w) + "\n" + footer
 	}
-	return m.Zones.Scan(lipgloss.NewStyle().Padding(1, 2).Render(components.Title.Render("Find missing messages") + "\n" + tabRow + "\n\n" + lipgloss.NewStyle().Height(h).MaxHeight(h).Width(w).Render(body) + "\n" + footer))
+	return m.Zones.Scan(lipgloss.NewStyle().Padding(1, 2).Render(m.appTitle(w) + "\n" + tabRow + "\n\n" + lipgloss.NewStyle().Height(h).MaxHeight(h).Width(w).Render(body) + "\n" + footer))
 }
 func (m *Model) packageBox(slot, width int) string {
 	id := []string{"open-old", "open-new"}[slot]
@@ -192,19 +278,33 @@ func (m *Model) packageBox(slot, width int) string {
 		}
 	}
 	if snapshot != nil {
-		name = filepath.Base(snapshot.Path) + ", " + number(int(snapshot.Count)) + " messages"
-		if snapshot.State == "loading" {
-			name = fmt.Sprintf("Loading %d%%, %s messages", min(100, snapshot.Bytes*100/max(1, snapshot.Total)), number(int(snapshot.Count)))
-		}
-		if snapshot.State == "stopped" {
-			name = "Stopped, " + number(int(snapshot.Count)) + " messages"
-		}
-		if snapshot.State == "partial" {
-			name = "Incomplete, " + number(int(snapshot.Count)) + " messages"
+		base := filepath.Base(snapshot.Path) + ", " + number(int(snapshot.Count)) + " messages"
+		switch snapshot.State {
+		case "loading":
+			if snapshot.Total <= 0 {
+				name = components.Working("Discovering package…", m.Frame, width-6)
+			} else {
+				percent := min(100, snapshot.Bytes*100/max(1, snapshot.Total))
+				phase := map[string]string{
+					"account": "reading account", "index": "reading index", "channels": "reading channels",
+					"messages": "reading messages", "activity": "reading activity",
+				}[snapshot.Phase]
+				if phase == "" {
+					phase = "reading package"
+				}
+				label := fmt.Sprintf("%d%%, %s, %s found", percent, phase, number(int(snapshot.Count)))
+				barWidth := min(10, max(4, width-9-lipgloss.Width(label)))
+				name = components.Spinner(m.Frame) + " " + components.Progress(float64(snapshot.Bytes)/float64(snapshot.Total), barWidth, m.Frame) + " " + lipgloss.NewStyle().Foreground(components.Cyan).Render(label)
+			}
+		case "stopped":
+			name = components.Warn.Render("Stopped, " + number(int(snapshot.Count)) + " messages")
+		case "partial":
+			name = lipgloss.NewStyle().Foreground(components.Deleted).Render("Incomplete, " + number(int(snapshot.Count)) + " messages")
+		default:
+			name = lipgloss.NewStyle().Foreground(components.Green).Render(base)
 		}
 	}
-	border := components.Border
-	fg := components.Accent
+	border := components.GradientColor(.48)
 	b := lipgloss.RoundedBorder()
 	if m.DropSlot == slot {
 		border = components.Accent
@@ -215,8 +315,10 @@ func (m *Model) packageBox(slot, width int) string {
 		}
 	}
 	if m.Hover == id || m.Focus == id {
-		border = lipgloss.Color("#FFB3E3")
-		fg = border
+		border = components.Brightness(components.Saturation(components.GradientColor(.82), .06), .06)
+	}
+	if snapshot != nil && snapshot.State == "loading" {
+		border = components.Brightness(components.GradientColor(.62), .04)
 	}
 	inner := width - 6
 	buttons := m.button([]string{"browse-old", "browse-new"}[slot], "Browse", false)
@@ -224,8 +326,8 @@ func (m *Model) packageBox(slot, width int) string {
 		buttons += " " + m.button([]string{"clear-old", "clear-new"}[slot], "Clear", false)
 	}
 	m.Actions = append(m.Actions, id)
-	body := components.Title.Foreground(fg).Render(components.Fit(label, inner)) + "\n" + components.Fit(name, inner) + "\n" + buttons
-	return m.Zones.Mark(id, lipgloss.NewStyle().Width(width-2).Padding(0, 2).Border(b).BorderForeground(border).Render(body))
+	body := components.FitStyled(name, inner) + "\n" + buttons
+	return m.Zones.Mark(id, components.TitledBox(label, body, width, 2, b, border, m.Frame, snapshot != nil && snapshot.State == "loading"))
 }
 func number(n int) string {
 	s := fmt.Sprint(n)
@@ -252,13 +354,75 @@ func relativeDate(date string, today time.Time) string {
 	}
 	return fmt.Sprintf("%s days ago", number(days))
 }
-func (m *Model) messageDate(id, date string) string {
+func (m *Model) messageDate(id, date string, color lipgloss.Color) string {
 	label := relativeDate(date, m.Session.Today)
+	messageTime, err := time.Parse(time.RFC3339Nano, date)
 	if m.Hover == id {
-		label = store.LocalDate(date)
+		if err == nil && len(m.Session.Filter.IncidentSeconds) > 0 {
+			label = messageTime.In(time.Local).Format("2006-01-02 15:04:05.000 -07:00")
+		} else {
+			label = store.LocalDate(date)
+		}
 	}
 	m.HoverOnly = append(m.HoverOnly, id)
-	return m.Zones.Mark(id, lipgloss.NewStyle().Foreground(components.Muted).Render(label))
+	return m.Zones.Mark(id, lipgloss.NewStyle().Foreground(color).Render(label))
+}
+
+func fullDateTime(date string) string {
+	messageTime, err := time.Parse(time.RFC3339Nano, date)
+	if err != nil {
+		return date
+	}
+	return messageTime.In(time.Local).Format("2006-01-02 15:04:05.000 -07:00")
+}
+
+func calendarAge(date string, today time.Time) string {
+	messageTime, err := time.Parse(time.RFC3339Nano, date)
+	if err != nil {
+		return "Unknown"
+	}
+	messageTime = messageTime.In(time.Local)
+	today = today.In(time.Local)
+	start := time.Date(messageTime.Year(), messageTime.Month(), messageTime.Day(), 0, 0, 0, 0, time.UTC)
+	end := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	suffix := " ago"
+	if start.After(end) {
+		start, end = end, start
+		suffix = " from now"
+	}
+	years := end.Year() - start.Year()
+	cursor := start.AddDate(years, 0, 0)
+	if cursor.After(end) {
+		years--
+		cursor = start.AddDate(years, 0, 0)
+	}
+	months := int(end.Month() - cursor.Month())
+	if end.Year() > cursor.Year() {
+		months += 12
+	}
+	if cursor.AddDate(0, months, 0).After(end) {
+		months--
+	}
+	cursor = cursor.AddDate(0, months, 0)
+	days := int(end.Sub(cursor) / (24 * time.Hour))
+	if start.Equal(end) {
+		return "0 days"
+	}
+	parts := make([]string, 0, 3)
+	for _, part := range []struct {
+		value int
+		unit  string
+	}{{years, "year"}, {months, "month"}, {days, "day"}} {
+		if part.value == 0 {
+			continue
+		}
+		unit := part.unit
+		if part.value != 1 {
+			unit += "s"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s", number(part.value), unit))
+	}
+	return strings.Join(parts, ", ") + suffix
 }
 func displayChannel(r store.Row) string {
 	name := session.Safe(r.Name)
@@ -288,11 +452,18 @@ func (m *Model) investigate(w, h int) string {
 	return box.Render()
 }
 func (m *Model) filters(w int) string {
-	parts := []string{m.field("search-input", &m.SearchInput, min(36, w)), components.Title.Render("Message dates"), m.field("days-input", &m.DayInput, min(34, w))}
+	parts := []string{m.field("search-input", &m.SearchInput, min(36, w)), components.Title.Render("Message dates"), m.button("clipboard", "Read from clipboard", false), m.field("days-input", &m.DayInput, min(34, w))}
 	parts = append(parts, m.button("dates", "Choose dates", false)+" "+m.button("dates-clear", "Clear", false))
 	parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Separate multiple dates with ;"))
 	dates := m.Session.Filter.Dates
-	if len(dates) == 0 {
+	incidents := m.Session.Filter.IncidentSeconds
+	if len(incidents) > 0 {
+		label := "Exact: " + time.Unix(incidents[0], 0).In(time.Local).Format("2006-01-02 15:04:05")
+		if len(incidents) > 1 {
+			label = fmt.Sprintf("%d exact incident times", len(incidents))
+		}
+		parts = append(parts, lipgloss.NewStyle().Foreground(components.Accent).Render(label))
+	} else if len(dates) == 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Any date"))
 	} else {
 		var chips []string
@@ -310,6 +481,9 @@ func (m *Model) filters(w int) string {
 	}
 	f := m.Session.Filter
 	margin := "Exact dates"
+	if len(f.IncidentSeconds) > 0 {
+		margin = "Exact incident seconds"
+	}
 	if f.DateBefore > 0 || f.DateAfter > 0 {
 		margin = fmt.Sprintf("Date margin: %d before, %d after", f.DateBefore, f.DateAfter)
 	}
@@ -341,11 +515,13 @@ func (m *Model) results(w, h int) string {
 		half := (w - 2) / 2
 		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Top, m.packageBox(0, half), "  ", m.packageBox(1, w-half-2)))
 	} else {
-		parts = append(parts, m.button("packages", "Packages", false)+"  "+components.Fit(m.packageSummary(), w-14))
+		parts = append(parts, m.button("packages", "Packages", false)+"  "+components.FitStyled(m.packageSummary(), w-14))
 	}
 	if !m.wide() {
 		label := "Dates & filters"
-		if len(m.Session.Filter.Dates) > 0 {
+		if len(m.Session.Filter.IncidentSeconds) > 0 {
+			label = fmt.Sprintf("Times & filters: %d", len(m.Session.Filter.IncidentSeconds))
+		} else if len(m.Session.Filter.Dates) > 0 {
 			label = fmt.Sprintf("Dates & filters: %d", len(m.Session.Filter.Dates))
 		}
 		control := m.button("filters", label, false)
@@ -362,7 +538,11 @@ func (m *Model) results(w, h int) string {
 		label = strings.TrimSuffix(label, "s")
 	}
 	modes := map[string]string{"auto": "Auto", "missing": "Missing", "all": "All", "older": "Older", "newer": "Newer", "present": "In both", "new": "New"}
-	header := components.Title.Render(number(total)+" "+label) + "  " + m.button("mode", modes[m.Session.Filter.Mode], false) + " " + m.button("previous", "‹", false) + " " + m.button("next", "›", false)
+	resultTitle := components.Title.Render(number(total) + " " + label)
+	if m.Loading {
+		resultTitle = components.Shimmer(number(total)+" "+label, m.Frame)
+	}
+	header := resultTitle + "  " + m.button("mode", modes[m.Session.Filter.Mode], false) + " " + m.button("previous", "‹", false) + " " + m.button("next", "›", false)
 	if m.PackagesExpanded {
 		header += " " + m.button("packages", "Hide packages", false)
 	}
@@ -380,7 +560,8 @@ func (m *Model) results(w, h int) string {
 			text = "No matching messages"
 		}
 		if m.Session.Busy() {
-			text = "Loading messages…"
+			parts = append(parts, components.Working("Loading messages…", m.Frame, w))
+			return strings.Join(parts, "\n")
 		}
 		parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Width(w).Render(text))
 	} else {
@@ -391,13 +572,52 @@ func (m *Model) results(w, h int) string {
 func (m *Model) packageSummary() string {
 	names := [2]string{"No older package", "No newer package"}
 	for _, s := range m.Snapshots {
-		names[s.Slot] = filepath.Base(s.Path) + ", " + number(int(s.Count)) + " messages"
+		if s.State == "loading" {
+			if s.Total > 0 {
+				percent := min(100, s.Bytes*100/max(1, s.Total))
+				names[s.Slot] = components.Spinner(m.Frame) + " " + lipgloss.NewStyle().Foreground(components.Cyan).Render(fmt.Sprintf("%d%%, %s messages", percent, number(int(s.Count))))
+			} else {
+				names[s.Slot] = components.Spinner(m.Frame) + " " + components.Shimmer("Discovering…", m.Frame)
+			}
+			continue
+		}
+		name := filepath.Base(s.Path) + ", " + number(int(s.Count)) + " messages"
+		if s.State == "ready" {
+			names[s.Slot] = lipgloss.NewStyle().Foreground(components.Green).Render(name)
+		} else if s.State == "partial" {
+			names[s.Slot] = lipgloss.NewStyle().Foreground(components.Deleted).Render("Incomplete, " + number(int(s.Count)) + " messages")
+		} else {
+			names[s.Slot] = components.Warn.Render("Stopped, " + number(int(s.Count)) + " messages")
+		}
 	}
 	return names[0] + " → " + names[1]
 }
+
+func messageIndex(id string) (int, bool) {
+	for _, prefix := range []string{"row-server-", "row-date-", "row-"} {
+		value, ok := strings.CutPrefix(id, prefix)
+		if !ok {
+			continue
+		}
+		index, err := strconv.Atoi(value)
+		return index, err == nil
+	}
+	return 0, false
+}
+
+func (m *Model) activeMessage(visible int) int {
+	for _, id := range []string{m.Hover, m.Focus} {
+		if index, ok := messageIndex(id); ok && index >= 0 && index < visible {
+			return index
+		}
+	}
+	return -1
+}
+
 func (m *Model) messages(w, h int) string {
 	visible := min(len(m.Rows), max(1, h/2))
 	total := m.resultCount()
+	active := m.activeMessage(visible)
 	listWidth := w
 	if total > visible {
 		listWidth = max(20, w-2)
@@ -407,13 +627,25 @@ func (m *Model) messages(w, h int) string {
 		id := fmt.Sprintf("row-%d", i)
 		serverID := fmt.Sprintf("row-server-%d", i)
 		eligible := r.Guild != "" && (len(m.Session.Filter.Guilds) != 1 || m.Session.Filter.Guilds[0] != r.Guild)
-		hover := m.Hover == id || m.Focus == id || m.Hover == serverID || m.Focus == serverID
-		metaStyle := lipgloss.NewStyle().Foreground(components.Accent)
-		contentStyle := lipgloss.NewStyle().Foreground(components.Text)
+		distance := -1
+		if active >= 0 {
+			distance = i - active
+			if distance < 0 {
+				distance = -distance
+			}
+		}
+		hover := active == i
+		metaColor := components.Accent
+		if r.Status == "missing" {
+			metaColor = components.Deleted
+		}
+		metaStyle := lipgloss.NewStyle().Foreground(components.Fade(metaColor, distance))
+		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(components.Text, distance))
+		mutedColor := components.Fade(components.Muted, distance)
 		rowStyle := lipgloss.NewStyle().Padding(0, 1).Width(listWidth - 2)
 		if hover {
 			rowStyle = rowStyle.Background(components.Surface)
-			metaStyle = metaStyle.Bold(true).Foreground(lipgloss.Color("#FFB3E3"))
+			metaStyle = metaStyle.Bold(true).Foreground(components.Pink)
 		}
 		action := ""
 		if eligible {
@@ -429,15 +661,12 @@ func (m *Model) messages(w, h int) string {
 		} else if r.HasAttachments {
 			media = ", attachment"
 		}
-		date := m.messageDate(fmt.Sprintf("row-date-%d", i), r.Date) + lipgloss.NewStyle().Foreground(components.Muted).Render(media)
+		date := m.messageDate(fmt.Sprintf("row-date-%d", i), r.Date, mutedColor) + lipgloss.NewStyle().Foreground(mutedColor).Render(media)
 		metaWidth := listWidth - 4
 		if action != "" {
 			metaWidth -= lipgloss.Width(action) + 1
 		}
 		nameWidth := max(8, metaWidth-lipgloss.Width(date)-2)
-		if r.Status == "missing" {
-			metaStyle = metaStyle.Foreground(components.Deleted)
-		}
 		name := metaStyle.Render(components.Fit(r.Server+" / "+displayChannel(r), nameWidth))
 		meta := name + strings.Repeat(" ", max(1, metaWidth-lipgloss.Width(name)-lipgloss.Width(date))) + date
 		if action != "" {
@@ -486,14 +715,15 @@ func (m *Model) scrollbar(total, visible, height int) string {
 		id := fmt.Sprintf("scrollbar-%d", line)
 		m.Actions = append(m.Actions, id)
 		glyph := "│"
-		color := components.Border
+		position := float64(line) / float64(max(1, height-1))
+		color := components.Brightness(components.Saturation(components.GradientColor(position), -.16), -.5)
 		if line >= thumbStart && line < thumbStart+thumbHeight {
 			glyph = "┃"
-			color = components.Accent
+			color = components.GradientColor(position)
 		}
 		if m.Hover == id || m.Focus == id {
 			glyph = "█"
-			color = lipgloss.Color("#FFB3E3")
+			color = components.Pink
 		}
 		lines[line] = m.Zones.Mark(id, lipgloss.NewStyle().Foreground(color).Render(glyph))
 	}
@@ -515,11 +745,18 @@ func (m *Model) servers() string {
 	w := min(m.Width-10, 120)
 	groups := m.filteredServers()
 	m.ServerOffset = min(m.ServerOffset, max(0, ((len(groups)-1)/m.serverPageSize())*m.serverPageSize()))
-	top := components.Title.Render("Servers") + "\n\n" + m.field("servers-input", &m.ServerInput, min(w, 38)) + "\n"
+	top := m.field("servers-input", &m.ServerInput, min(w, 38)) + "\n"
 	top += m.button("servers-close", "Done", true) + " " + m.button("servers-clear", "Clear selection", false) + " " + m.button("servers-prev", "‹", false) + " " + m.button("servers-next", "›", false)
-	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(fmt.Sprintf("%d matches, %d selected", len(groups), len(m.Session.Filter.Guilds))) + "\n\n"
+	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(fmt.Sprintf("%d matches, %d selected", len(groups), len(m.Session.Filter.Guilds))) + "\n"
+	if m.ServerInput.Value() != m.ServerSearch {
+		top += components.Working("Searching servers…", m.Frame, w) + "\n"
+	}
+	top += "\n"
 	if len(groups) == 0 {
-		return lipgloss.NewStyle().Width(w).Render(top + "No matching servers")
+		if m.ServerInput.Value() != m.ServerSearch {
+			return lipgloss.NewStyle().Width(w).Render(top)
+		}
+		return lipgloss.NewStyle().Width(w).Render(top + lipgloss.NewStyle().Foreground(components.Muted).Render("No matching servers"))
 	}
 	columns := m.serverColumns()
 	cellWidth := (w - (columns-1)*2) / columns
@@ -545,7 +782,7 @@ func (m *Model) servers() string {
 			style = style.Foreground(components.Accent).Bold(true)
 		}
 		if m.Hover == id || m.Focus == id {
-			boxStyle = boxStyle.Background(lipgloss.Color("#37445E"))
+			boxStyle = boxStyle.Background(components.SurfaceHover)
 			style = style.Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
 		}
 		name := components.Highlight(components.Fit(g.Name, cellWidth-6), m.ServerSearch, style)
@@ -571,7 +808,20 @@ func (m *Model) servers() string {
 	return top + lipgloss.JoinHorizontal(lipgloss.Top, grid...)
 }
 func (m *Model) console(w, h int) string {
-	transcript := strings.Join(m.Transcript, "\n\n")
+	blocks := make([]string, len(m.Transcript))
+	for i, block := range m.Transcript {
+		switch {
+		case strings.HasPrefix(block, "› "):
+			blocks[i] = lipgloss.NewStyle().Foreground(components.Cyan).Bold(true).Render(block)
+		case strings.HasPrefix(block, "Error:"):
+			blocks[i] = lipgloss.NewStyle().Foreground(components.Deleted).Render(block)
+		case strings.HasPrefix(block, "Saved ") || strings.HasPrefix(block, "Applied "):
+			blocks[i] = lipgloss.NewStyle().Foreground(components.Green).Render(block)
+		default:
+			blocks[i] = block
+		}
+	}
+	transcript := strings.Join(blocks, "\n\n")
 	if transcript == "" {
 		transcript = session.HelpPanel(h)
 	}

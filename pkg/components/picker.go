@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -38,6 +39,7 @@ type DirectoryMsg struct {
 type DirectoryCountMsg struct {
 	Path       string
 	Count      int
+	Package    bool
 	Err        error
 	Generation uint64
 }
@@ -45,6 +47,11 @@ type DirectoryCountMsg struct {
 type PickedMsg struct {
 	Path       string
 	Generation uint64
+}
+
+type pickerClickMsg struct {
+	ID                        string
+	Generation, ClickRevision uint64
 }
 
 type columnBounds struct{ Index, X, Y, Width int }
@@ -69,10 +76,16 @@ type Picker struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	counts          map[string]int
+	packages        map[string]bool
 	pending         map[string]bool
+	clickID         string
+	clickAt         time.Time
+	clickRevision   uint64
 }
 
 var pickerGeneration atomic.Uint64
+
+const doubleClickInterval = 450 * time.Millisecond
 
 func NewPicker(ctx context.Context, start string) Picker {
 	t := textinput.New()
@@ -82,7 +95,7 @@ func NewPicker(ctx context.Context, start string) Picker {
 	t.SetValue(start)
 	t.CursorEnd()
 	t.Focus()
-	return Picker{Path: t, Height: 12, expanded: -1, parent: ctx, counts: map[string]int{}, pending: map[string]bool{}}
+	return Picker{Path: t, Height: 12, expanded: -1, parent: ctx, counts: map[string]int{}, packages: map[string]bool{}, pending: map[string]bool{}}
 }
 
 func CleanPath(p string) string {
@@ -110,6 +123,10 @@ func (p *Picker) Close() {
 	}
 }
 
+func (p Picker) Busy() bool {
+	return p.Loading || len(p.pending) > 0
+}
+
 func (p *Picker) Navigate(dest string) tea.Cmd {
 	dest = CleanPath(dest)
 	if !strings.EqualFold(filepath.Ext(dest), ".zip") {
@@ -130,6 +147,8 @@ func (p *Picker) resolve(navigate bool) tea.Cmd {
 	p.selected = ""
 	p.hint = ""
 	p.pendingAction = ""
+	p.clickID = ""
+	p.clickRevision++
 	input, gen, ctx := p.Path.Value(), p.Generation, p.ctx
 	cache := make(map[string][]Entry, len(p.Columns))
 	for _, col := range p.Columns {
@@ -468,7 +487,39 @@ func (p *Picker) Action(id string) tea.Cmd {
 	return p.CountVisible()
 }
 
+func (p *Picker) MouseAction(id string) tea.Cmd {
+	var col, row int
+	if _, err := fmt.Sscanf(id, "pick-entry-%d-%d", &col, &row); err != nil || col < 0 || col >= len(p.Columns) || row < 0 || row >= len(p.Columns[col].Entries) || !p.Columns[col].Entries[row].Dir {
+		return p.Action(id)
+	}
+
+	path := filepath.Join(p.Columns[col].Path, p.Columns[col].Entries[row].Name)
+	now := time.Now()
+	if p.clickID == id && now.Sub(p.clickAt) <= doubleClickInterval {
+		p.clickID = ""
+		p.clickRevision++
+		gen := p.Generation
+		return func() tea.Msg { return PickedMsg{Path: path, Generation: gen} }
+	}
+
+	p.selected = path
+	p.clickID = id
+	p.clickAt = now
+	p.clickRevision++
+	revision, gen := p.clickRevision, p.Generation
+	return tea.Tick(doubleClickInterval, func(time.Time) tea.Msg {
+		return pickerClickMsg{ID: id, Generation: gen, ClickRevision: revision}
+	})
+}
+
 func (p *Picker) Update(msg tea.Msg) tea.Cmd {
+	if click, ok := msg.(pickerClickMsg); ok {
+		if click.Generation != p.Generation || click.ClickRevision != p.clickRevision || click.ID != p.clickID {
+			return nil
+		}
+		p.clickID = ""
+		return p.Action(click.ID)
+	}
 	if k, ok := msg.(tea.KeyMsg); ok {
 		switch k.String() {
 		case "up", "down":
@@ -562,39 +613,69 @@ func (p *Picker) CountVisible() tea.Cmd {
 			p.pending[path] = true
 			ctx, gen := p.ctx, p.Generation
 			commands = append(commands, func() tea.Msg {
-				count, err := countDirectories(ctx, path)
-				return DirectoryCountMsg{Path: path, Count: count, Err: err, Generation: gen}
+				count, candidate, err := inspectDirectory(ctx, path)
+				return DirectoryCountMsg{Path: path, Count: count, Package: candidate, Err: err, Generation: gen}
 			})
 		}
 	}
 	return tea.Batch(commands...)
 }
 
-func countDirectories(ctx context.Context, path string) (int, error) {
+func inspectDirectory(ctx context.Context, path string) (int, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer f.Close()
 	count := 0
+	messagesDir := ""
 	for {
 		if err := ctx.Err(); err != nil {
-			return count, err
+			return count, false, err
 		}
 		entries, err := f.ReadDir(128)
 		for _, entry := range entries {
 			if entry.IsDir() {
 				count++
+				if strings.EqualFold(entry.Name(), "Messages") {
+					messagesDir = entry.Name()
+				}
 			}
 		}
 		if err == io.EOF {
-			return count, nil
+			break
 		}
 		if err != nil {
-			return count, err
+			return count, false, err
+		}
+	}
+	if messagesDir == "" {
+		return count, false, nil
+	}
+
+	messages, err := os.Open(filepath.Join(path, messagesDir))
+	if err != nil {
+		return count, false, err
+	}
+	defer messages.Close()
+	for {
+		if err := ctx.Err(); err != nil {
+			return count, false, err
+		}
+		entries, err := messages.ReadDir(128)
+		if slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+			return !entry.IsDir() && strings.EqualFold(entry.Name(), "index.json")
+		}) {
+			return count, true, nil
+		}
+		if err == io.EOF {
+			return count, false, nil
+		}
+		if err != nil {
+			return count, false, err
 		}
 	}
 }
@@ -608,6 +689,7 @@ func (p *Picker) ApplyCount(m DirectoryCountMsg) tea.Cmd {
 		p.counts[m.Path] = -1
 	} else {
 		p.counts[m.Path] = m.Count
+		p.packages[m.Path] = m.Package
 	}
 	return p.CountVisible()
 }

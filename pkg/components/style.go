@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
@@ -14,17 +16,34 @@ import (
 	"github.com/ellypaws/unpackage/pkg/session"
 )
 
-var Accent = lipgloss.Color("#B59AF6")
+const gradientSteps = 64
+
+var gradientRamp = buildGradient(gradientSteps, tone{212, .32, .92}, tone{270, .24, .88})
+var Accent = GradientColor(.68)
+var Cyan = GradientColor(.08)
+var Pink = GradientColor(.92)
+var Green = lipgloss.Color("#7ED6A5")
 var Muted = lipgloss.Color("#A4A6B5")
 var MutedStyle = lipgloss.NewStyle().Foreground(Muted)
 var Warn = lipgloss.NewStyle().Foreground(lipgloss.Color("#E8BE79"))
 var Deleted = lipgloss.Color("#F7768E")
 var Title = lipgloss.NewStyle().Bold(true).Foreground(Accent)
-var Border = lipgloss.Color("#57516D")
+var Border = Brightness(Saturation(GradientColor(.56), -.12), -.48)
 var Surface = lipgloss.Color("#252331")
+var SurfaceHover = lipgloss.Color("#303044")
 var Text = lipgloss.Color("#E1DDEB")
 
+var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+var adjustedColors sync.Map
+var gradientText sync.Map
+var shimmerText sync.Map
+var separatorText sync.Map
+
 func Fit(s string, w int) string { return ansi.Truncate(session.Safe(s), max(1, w), "…") }
+func FitStyled(s string, w int) string {
+	return ansi.Truncate(s, max(1, w), "…")
+}
 func DisabledButton(label string) string {
 	return lipgloss.NewStyle().Foreground(Border).Padding(0, 1).Render(label)
 }
@@ -60,7 +79,7 @@ func Button(z *zone.Manager, id, label, hover, focus string, active bool) string
 		}
 	}
 	if id == hover || id == focus {
-		st = st.Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#37445E")).Underline(true).Bold(true)
+		st = st.Foreground(lipgloss.Color("#FFFFFF")).Background(SurfaceHover).Underline(true).Bold(true)
 		if os.Getenv("NO_COLOR") != "" {
 			prefix = ">"
 		}
@@ -78,7 +97,7 @@ func Tab(z *zone.Manager, id, label, hover, focus string, active bool, padding i
 		style = style.Border(b).Foreground(Accent).Bold(true)
 	}
 	if hover == id || focus == id {
-		style = style.Foreground(lipgloss.Color("#FFB3E3")).BorderForeground(Accent).Underline(true).Bold(true)
+		style = style.Foreground(Pink).BorderForeground(Accent).Underline(true).Bold(true)
 		if os.Getenv("NO_COLOR") != "" {
 			label = ">" + label
 		}
@@ -86,44 +105,369 @@ func Tab(z *zone.Manager, id, label, hover, focus string, active bool, padding i
 	return z.Mark(id, style.Render(label))
 }
 func Rule(frac float64, w int) string {
+	return progress(frac, w, 0, false)
+}
+
+func Progress(frac float64, w, frame int) string {
+	return progress(frac, w, frame, true)
+}
+
+func progress(frac float64, w, frame int, moving bool) string {
 	w = max(0, w)
 	n := float64(w) * max(0, min(1, frac))
+	sweep := frame%(w+6) - 3
 	var b strings.Builder
 	for i := 0; i < w; i++ {
 		glyph := "─"
-		color := "#454957"
+		color := Brightness(Saturation(GradientColor(float64(i)/float64(max(1, w-1))), -.16), -.58)
 		if float64(i) < n {
 			glyph = "━"
-			h := float64(i)/float64(max(1, w))*150 + 190
-			color = hsv(h)
+			color = GradientColor(float64(i) / float64(max(1, w-1)))
+			distance := i - sweep
+			if distance < 0 {
+				distance = -distance
+			}
+			if moving && distance <= 1 {
+				color = Brightness(Saturation(color, -.08), .08)
+			}
+		} else if moving {
+			color = Brightness(color, -.04*float64(i-int(n)))
 		}
 		if os.Getenv("NO_COLOR") != "" {
 			b.WriteString(glyph)
 		} else {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(glyph))
+			b.WriteString(lipgloss.NewStyle().Foreground(color).Render(glyph))
 		}
 	}
 	return b.String()
 }
-func hsv(h float64) string {
-	c := 0.58
-	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
+
+func Indeterminate(w, frame int) string {
+	w = max(0, w)
+	if w == 0 {
+		return ""
+	}
+	center := frame%(w+4) - 2
+	var b strings.Builder
+	for i := range w {
+		distance := i - center
+		if distance < 0 {
+			distance = -distance
+		}
+		glyph := "─"
+		color := Brightness(Saturation(GradientColor(float64(i)/float64(max(1, w-1))), -.16), -.58)
+		if distance <= 1 {
+			glyph = "━"
+			color = Brightness(GradientColor(float64(i)/float64(max(1, w-1))), .06-float64(distance)*.04)
+		}
+		if os.Getenv("NO_COLOR") != "" {
+			b.WriteString(glyph)
+		} else {
+			b.WriteString(lipgloss.NewStyle().Foreground(color).Render(glyph))
+		}
+	}
+	return b.String()
+}
+
+func Spinner(frame int) string {
+	glyph := string(spinnerFrames[frame%len(spinnerFrames)])
+	if os.Getenv("NO_COLOR") != "" {
+		return glyph
+	}
+	position := float64(frame%12) / 11
+	return lipgloss.NewStyle().Foreground(GradientColor(position)).Bold(true).Render(glyph)
+}
+
+func Working(label string, frame, width int) string {
+	labelWidth := max(1, width-16)
+	label = Fit(label, labelWidth)
+	line := Spinner(frame) + " " + Shimmer(label, frame)
+	barWidth := min(10, max(0, width-lipgloss.Width(line)-1))
+	if barWidth > 0 {
+		line += " " + Indeterminate(barWidth, frame)
+	}
+	return FitStyled(line, width)
+}
+
+func Shimmer(text string, frame int) string {
+	if os.Getenv("NO_COLOR") != "" {
+		return text
+	}
+	runes := []rune(text)
+	position := frame%(len(runes)+8) - 4
+	key := struct {
+		Text     string
+		Position int
+	}{text, position}
+	if cached, ok := shimmerText.Load(key); ok {
+		return cached.(string)
+	}
+	base := Brightness(Saturation(GradientColor(.52), -.14), -.18)
+	var b strings.Builder
+	for i, r := range runes {
+		if r == ' ' {
+			b.WriteRune(r)
+			continue
+		}
+		distance := i - position
+		if distance < 0 {
+			distance = -distance
+		}
+		color := base
+		if distance <= 3 {
+			color = Brightness(Saturation(base, -.05), []float64{.27, .18, .10, .04}[distance])
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(color).Render(string(r)))
+	}
+	result := b.String()
+	shimmerText.Store(key, result)
+	return result
+}
+
+func Gradient(text string) string {
+	if os.Getenv("NO_COLOR") != "" {
+		return lipgloss.NewStyle().Bold(true).Render(text)
+	}
+	if cached, ok := gradientText.Load(text); ok {
+		return cached.(string)
+	}
+	var b strings.Builder
+	runes := []rune(text)
+	for i, r := range runes {
+		if r == ' ' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(GradientColor(float64(i) / float64(max(1, len(runes)-1)))).Bold(true).Render(string(r)))
+	}
+	result := b.String()
+	gradientText.Store(text, result)
+	return result
+}
+
+func GradientColor(position float64) lipgloss.Color {
+	position = max(0, min(1, position))
+	return gradientRamp[int(position*float64(len(gradientRamp)-1)+.5)]
+}
+
+func Brightness(color lipgloss.Color, amount float64) lipgloss.Color {
+	return adjust(color, 0, amount)
+}
+
+func Saturation(color lipgloss.Color, amount float64) lipgloss.Color {
+	return adjust(color, amount, 0)
+}
+
+func Fade(color lipgloss.Color, distance int) lipgloss.Color {
+	if distance < 0 {
+		return color
+	}
+	distance = min(5, distance)
+	brightness := []float64{.06, -.13, -.25, -.36, -.45, -.52}[distance]
+	saturation := []float64{.04, -.03, -.07, -.11, -.14, -.16}[distance]
+	return Brightness(Saturation(color, saturation), brightness)
+}
+
+func Separator(width int) string {
+	width = max(0, width)
+	if os.Getenv("NO_COLOR") != "" {
+		return strings.Repeat("─", width)
+	}
+	if cached, ok := separatorText.Load(width); ok {
+		return cached.(string)
+	}
+	var b strings.Builder
+	for i := range width {
+		color := Brightness(Saturation(GradientColor(float64(i)/float64(max(1, width-1))), -.16), -.52)
+		b.WriteString(lipgloss.NewStyle().Foreground(color).Render("─"))
+	}
+	result := b.String()
+	separatorText.Store(width, result)
+	return result
+}
+
+func TitleRule(title string, width, frame int, active bool) string {
+	title = Fit(title, max(1, width-5))
+	left := Separator(min(2, width))
+	if width <= 3 {
+		return left
+	}
+	styledTitle := Gradient(title)
+	if active {
+		styledTitle = Shimmer(title, frame)
+	}
+	used := lipgloss.Width(left) + 2 + lipgloss.Width(styledTitle)
+	right := Separator(max(0, width-used))
+	return FitStyled(left+" "+styledTitle+" "+right, width)
+}
+
+func TitledBox(title, body string, width, padding int, border lipgloss.Border, color lipgloss.Color, frame int, active bool) string {
+	width = max(6, width)
+	padding = max(0, padding)
+	contentWidth := max(1, width-2-padding*2)
+	title = Fit(title, max(1, width-7))
+	styledTitle := Gradient(title)
+	if active {
+		styledTitle = Shimmer(title, frame)
+	}
+
+	topWidth := width - 2
+	leftWidth := min(2, max(1, topWidth-lipgloss.Width(styledTitle)-2))
+	rightWidth := max(0, topWidth-leftWidth-lipgloss.Width(styledTitle)-2)
+	top := borderCell(border.TopLeft, color) + borderRun(border.Top, leftWidth, color, 0, .12) + " " + styledTitle + " " + borderRun(border.Top, rightWidth, color, .12, 1) + borderCell(border.TopRight, color)
+
+	lines := strings.Split(body, "\n")
+	var out strings.Builder
+	out.WriteString(top)
+	for i, line := range lines {
+		if lipgloss.Width(line) > contentWidth {
+			line = ansi.Truncate(line, contentWidth, "")
+		}
+		line = lipgloss.NewStyle().Width(contentWidth).Render(line)
+		position := float64(i+1) / float64(len(lines)+1)
+		side := Brightness(Saturation(color, -.04*position), -.12*position)
+		out.WriteByte('\n')
+		out.WriteString(borderCell(border.Left, side))
+		out.WriteString(strings.Repeat(" ", padding))
+		out.WriteString(line)
+		out.WriteString(strings.Repeat(" ", padding))
+		out.WriteString(borderCell(border.Right, side))
+	}
+	bottom := Brightness(Saturation(color, -.04), -.12)
+	out.WriteByte('\n')
+	out.WriteString(borderCell(border.BottomLeft, bottom))
+	out.WriteString(borderRun(border.Bottom, width-2, bottom, 0, 1))
+	out.WriteString(borderCell(border.BottomRight, bottom))
+	return out.String()
+}
+
+func borderRun(glyph string, width int, color lipgloss.Color, start, end float64) string {
+	if os.Getenv("NO_COLOR") != "" {
+		return strings.Repeat(glyph, width)
+	}
+	var b strings.Builder
+	for i := range width {
+		position := start + (end-start)*float64(i)/float64(max(1, width-1))
+		b.WriteString(borderCell(glyph, Brightness(Saturation(color, -.03*position), -.06*position)))
+	}
+	return b.String()
+}
+
+func borderCell(glyph string, color lipgloss.Color) string {
+	if os.Getenv("NO_COLOR") != "" {
+		return glyph
+	}
+	return lipgloss.NewStyle().Foreground(color).Render(glyph)
+}
+
+type rgb struct{ r, g, b int }
+
+type tone struct {
+	h, s, v float64
+}
+
+func (c rgb) hex() string {
+	return fmt.Sprintf("#%02x%02x%02x", c.r, c.g, c.b)
+}
+
+func (c tone) brightness(amount float64) tone {
+	c.v = max(0, min(1, c.v+amount))
+	return c
+}
+
+func (c tone) saturation(amount float64) tone {
+	c.s = max(0, min(1, c.s+amount))
+	return c
+}
+
+func (c tone) rgb() rgb {
+	h := math.Mod(c.h, 360)
+	if h < 0 {
+		h += 360
+	}
+	chroma := c.v * c.s
+	x := chroma * (1 - math.Abs(math.Mod(h/60, 2)-1))
 	var r, g, b float64
 	switch {
 	case h < 60:
-		r, g = c, x
+		r, g = chroma, x
 	case h < 120:
-		r, g = x, c
+		r, g = x, chroma
 	case h < 180:
-		g, b = c, x
+		g, b = chroma, x
 	case h < 240:
-		g, b = x, c
+		g, b = x, chroma
 	case h < 300:
-		r, b = x, c
+		r, b = x, chroma
 	default:
-		r, b = c, x
+		r, b = chroma, x
 	}
-	return fmt.Sprintf("#%02x%02x%02x", int((r+.32)*255), int((g+.32)*255), int((b+.32)*255))
+	m := c.v - chroma
+	return rgb{int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)}
+}
+
+func buildGradient(steps int, start, end tone) []lipgloss.Color {
+	colors := make([]lipgloss.Color, steps)
+	for i := range steps {
+		position := float64(i) / float64(max(1, steps-1))
+		current := tone{
+			h: start.h + (end.h-start.h)*position,
+			s: start.s + (end.s-start.s)*position,
+			v: start.v + (end.v-start.v)*position,
+		}
+		colors[i] = lipgloss.Color(current.rgb().hex())
+	}
+	return colors
+}
+
+func adjust(color lipgloss.Color, saturation, brightness float64) lipgloss.Color {
+	key := struct {
+		Color                  lipgloss.Color
+		Saturation, Brightness float64
+	}{color, saturation, brightness}
+	if cached, ok := adjustedColors.Load(key); ok {
+		return cached.(lipgloss.Color)
+	}
+	value := string(color)
+	if len(value) != 7 || value[0] != '#' {
+		return color
+	}
+	r, errR := strconv.ParseInt(value[1:3], 16, 0)
+	g, errG := strconv.ParseInt(value[3:5], 16, 0)
+	b, errB := strconv.ParseInt(value[5:7], 16, 0)
+	if errR != nil || errG != nil || errB != nil {
+		return color
+	}
+	result := rgbTone(rgb{int(r), int(g), int(b)}).saturation(saturation).brightness(brightness).rgb()
+	adjusted := lipgloss.Color(result.hex())
+	adjustedColors.Store(key, adjusted)
+	return adjusted
+}
+
+func rgbTone(c rgb) tone {
+	r, g, b := float64(c.r)/255, float64(c.g)/255, float64(c.b)/255
+	maximum := max(r, g, b)
+	minimum := min(r, g, b)
+	delta := maximum - minimum
+	hue := 0.0
+	if delta != 0 {
+		switch maximum {
+		case r:
+			hue = 60 * math.Mod((g-b)/delta, 6)
+		case g:
+			hue = 60 * ((b-r)/delta + 2)
+		case b:
+			hue = 60 * ((r-g)/delta + 4)
+		}
+	}
+	if hue < 0 {
+		hue += 360
+	}
+	saturation := 0.0
+	if maximum != 0 {
+		saturation = delta / maximum
+	}
+	return tone{hue, saturation, maximum}
 }
 func Spark(ns []int) string {
 	peak := 1

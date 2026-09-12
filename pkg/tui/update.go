@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/ellypaws/unpackage/pkg/components"
+	"github.com/ellypaws/unpackage/pkg/importer"
 	"github.com/ellypaws/unpackage/pkg/session"
 	"github.com/ellypaws/unpackage/pkg/store"
 )
@@ -32,6 +34,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.Session.Filter.Search = v.Value
+		return m, m.changed()
+	case incidentInputMsg:
+		if v.Revision != m.IncidentInputRevision {
+			return m, nil
+		}
+		m.IncidentProcessing = ""
+		if v.Err != nil {
+			m.Notice = v.Err.Error()
+			return m, nil
+		}
+		if !v.Recognized {
+			m.Notice = "Pasted JSON has no Discord incident times"
+			if v.Clipboard {
+				m.Notice = "Clipboard has no Discord incident times"
+			}
+			return m, nil
+		}
+		m.Session.Filter.IncidentSeconds = v.Seconds
+		m.Session.Filter.Dates = nil
+		m.Session.Filter.From = ""
+		m.Session.Filter.Until = ""
+		m.Session.Filter.DateBefore = 0
+		m.Session.Filter.DateAfter = 0
+		m.Input.SetValue("")
+		m.DayInput.SetValue("")
+		m.Notice = fmt.Sprintf("Applied %d exact incident times", len(v.Seconds))
 		return m, m.changed()
 	case dropCheckMsg:
 		if v.Revision != m.DropRevision {
@@ -69,14 +97,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.changed()
 	case tickMsg:
+		active := m.workLabel() != ""
+		if active {
+			m.Frame++
+		}
 		pending := m.Session.Busy()
 		for _, s := range m.Snapshots {
 			pending = pending || s.State == "loading"
 		}
 		if pending {
-			return m, tea.Batch(tick(), m.refresh())
+			return m, tea.Batch(tick(active), m.refresh())
 		}
-		return m, tick()
+		return m, tick(active)
 	case dataMsg:
 		m.Loading = false
 		if v.Revision != m.Revision {
@@ -168,6 +200,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft {
 					m.Focus = "pick-input"
 					m.focusInput()
+					if strings.HasPrefix(id, "pick-entry-") {
+						return m, tea.Batch(cmd, m.Picker.MouseAction(id))
+					}
 					return m, tea.Batch(cmd, m.action(id))
 				}
 				return m, cmd
@@ -225,6 +260,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if v.Paste && m.Tab == tabInvestigate && likelyIncidentPaste(v.Runes) && !m.Executing && m.Picker == nil && m.Calendar == nil && !m.RequestDialog && !m.MarginDialog {
+			m.IncidentInputRevision++
+			revision := m.IncidentInputRevision
+			runes := v.Runes
+			m.IncidentProcessing = "Reading pasted incident times…"
+			m.Notice = ""
+			return m, func() tea.Msg {
+				seconds, recognized, err := importer.IncidentSecondsJSON([]byte(string(runes)))
+				return incidentInputMsg{Seconds: seconds, Recognized: recognized, Err: err, Revision: revision}
+			}
+		}
 		key := v.String()
 		if len(v.Runes) > 0 && !m.Executing && m.Picker == nil && m.Calendar == nil && !m.RequestDialog && !m.MarginDialog {
 			text := string(v.Runes)
@@ -541,6 +587,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return m, cmd
 }
+
+func likelyIncidentPaste(runes []rune) bool {
+	const probeLimit = 64 << 10
+	probe := string(runes[:min(len(runes), probeLimit)])
+	trimmed := strings.TrimLeft(probe, " \t\r\n")
+	return strings.HasPrefix(trimmed, "[") && (strings.Contains(probe, `"incident_time"`) || strings.Contains(probe, `"safety_policy_notice"`))
+}
+
 func (m *Model) action(id string) tea.Cmd {
 	if !m.enabled(id) {
 		return nil
@@ -582,6 +636,7 @@ func (m *Model) action(id string) tea.Cmd {
 			m.focusInput()
 		case "cal-apply":
 			m.Session.Filter.Dates = slices.Clone(m.Calendar.Dates)
+			m.Session.Filter.IncidentSeconds = nil
 			m.Session.Filter.From = ""
 			m.Session.Filter.Until = ""
 			m.Calendar = nil
@@ -682,6 +737,19 @@ func (m *Model) action(id string) tea.Cmd {
 	case "dates", "dates-more":
 		c := components.NewCalendar(m.Session.Today, m.Session.Filter.Dates)
 		m.Calendar = &c
+	case "clipboard":
+		m.IncidentInputRevision++
+		revision := m.IncidentInputRevision
+		m.IncidentProcessing = "Reading clipboard…"
+		m.Notice = ""
+		return func() tea.Msg {
+			text, err := clipboard.ReadAll()
+			if err != nil {
+				return incidentInputMsg{Clipboard: true, Err: fmt.Errorf("read clipboard: %w", err), Revision: revision}
+			}
+			seconds, recognized, err := importer.IncidentSecondsJSON([]byte(text))
+			return incidentInputMsg{Seconds: seconds, Recognized: recognized, Clipboard: true, Err: err, Revision: revision}
+		}
 	case "clear":
 		m.DayInput.SetValue("")
 		m.SearchInput.SetValue("")
@@ -814,6 +882,7 @@ func (m *Model) action(id string) tea.Cmd {
 			return nil
 		}
 		m.Session.Filter.Dates = slices.Compact(slices.Sorted(slices.Values(append(m.Session.Filter.Dates, dates...))))
+		m.Session.Filter.IncidentSeconds = nil
 		m.DayInput.SetValue("")
 		m.Session.Filter.From = ""
 		m.Session.Filter.Until = ""
@@ -824,6 +893,7 @@ func (m *Model) action(id string) tea.Cmd {
 	case "dates-clear":
 		m.DayInput.SetValue("")
 		m.Session.Filter.Dates = nil
+		m.Session.Filter.IncidentSeconds = nil
 		m.Session.Filter.From = ""
 		m.Session.Filter.Until = ""
 		return m.changed()

@@ -53,10 +53,17 @@ rows high for the full-screen interface.
 The app keeps what it reads in memory for the current session. It does not change your source
 packages. Close the app to clear the loaded data.
 
+Use `Read from clipboard` in the Investigate tab after copying a Discord safety-notice message
+response. This avoids terminals that replay Ctrl+V input synchronously. Recognized responses apply
+every `incident_time` as an exact-second message filter. Clipboard contents are processed in memory
+and are not shown in the command console or written to logs.
+
 The package browser keeps parent folders visible in columns. Hover a narrow column to expand it.
 Type part of a folder name to filter and highlight fuzzy matches, then use `Tab` to complete the
-first match. A trailing slash enters a directory. `Choose this package` selects the named folder
-or ZIP. Directory counts appear as they finish and hide when space is limited.
+first match. A trailing slash enters a directory. Single-click a folder to open it, or double-click
+one to choose it for scanning. `Choose this package` selects the named folder or ZIP. Folders with
+a `Messages/index.json` package structure are marked `Package`. Directory counts appear as they
+finish and hide when space is limited.
 
 The older and newer browsers share their starting location until each has a selected package.
 After that, each remembers its own location for the current session.

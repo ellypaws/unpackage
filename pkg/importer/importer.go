@@ -294,8 +294,12 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				}
 				hasAttachments := m["has_attachments"] == "1" || attachmentPresent(m["attachments"])
 				hasMedia := m["has_media"] == "1" || attachmentMedia(m["attachments"])
-				messages = append(messages, store.Message{ID: id, Channel: f.channel, Date: store.Day(id), Content: body, HasAttachments: hasAttachments, HasMedia: hasMedia})
+				attachmentURLs := attachmentURLs(m["attachments"], m[attachmentURLsKey])
+				messages = append(messages, store.Message{ID: id, Channel: f.channel, Date: store.Day(id), Content: body, AttachmentURLs: attachmentURLs, HasAttachments: hasAttachments, HasMedia: hasMedia})
 				messageBytes += len(body)
+				for _, attachmentURL := range attachmentURLs {
+					messageBytes += len(attachmentURL)
+				}
 				if len(messages) >= 256 || messageBytes >= 2<<20 {
 					return flushMessages()
 				}

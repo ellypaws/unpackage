@@ -28,7 +28,6 @@ func (c *Calendar) Toggle(day string) {
 }
 func (c Calendar) View(z *zone.Manager, hover, focus string, canApply bool) string {
 	var b strings.Builder
-	b.WriteString(Title.Render("Dates") + "\n\n")
 	b.WriteString(Button(z, "cal-prev", "‹", hover, focus, false) + " " + c.Month.Format("January 2006") + " " + Button(z, "cal-next", "›", hover, focus, false) + "\n\n Mo   Tu   We   Th   Fr   Sa   Su\n")
 	first := (int(c.Month.Weekday()) + 6) % 7
 	days := c.Month.AddDate(0, 1, -1).Day()
