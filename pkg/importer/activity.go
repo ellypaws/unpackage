@@ -21,46 +21,10 @@ var eventKinds = map[string]store.EventKind{
 	"message_deleted":      store.EventDelete,
 }
 
-func activityEvent(m map[string]string) (store.Event, bool) {
-	kind := eventKinds[m["event_type"]]
-	if kind == 0 {
-		return store.Event{}, false
-	}
-	at, ok := eventTime(m["timestamp"])
-	if !ok {
-		return store.Event{}, false
-	}
-	e := store.Event{ID: m["event_id"], Kind: kind, Time: at, Platform: platform(m["os"], m["browser"])}
-	if e.ID == "" {
-		e.ID = m["event_type"] + "\x00" + m["timestamp"] + "\x00" + m["channel_id"]
-	}
-	if digits(m["guild_id"]) {
-		e.Guild = m["guild_id"]
-	}
-	if digits(m["channel_id"]) {
-		e.Channel = m["channel_id"]
-	} else if digits(m["channel"]) {
-		e.Channel = m["channel"]
-	}
-	switch kind {
-	case store.EventVoice:
-		// Screen-share streams report their own disconnects inside the voice session that carries them.
-		if m["context"] == "stream" {
-			return store.Event{}, false
-		}
-		ms := integer(m["duration_connected_ms"])
-		if ms <= 0 {
-			ms = integer(m["duration"])
-		}
-		e.Duration = time.Duration(ms) * time.Millisecond
-	case store.EventGame:
-		e.Name = cmp.Or(m["application_name"], m["application_id"])
-		e.Duration = time.Duration(integer(m["activity_duration_s"])) * time.Second
-		e.Total = time.Duration(integer(m["total_duration_s"])) * time.Second
-	case store.EventReaction:
-		e.Name = m["emoji_name"]
-	}
-	return e, true
+type activityFacts struct {
+	Channel store.ChannelObservation
+	Event   store.Event
+	Sent    store.SentMessage
 }
 
 func activitySource(name string) store.ActivitySource {
@@ -93,12 +57,16 @@ func activityChannel(m map[string]string) (string, string) {
 	return channel, guild
 }
 
-func activityChannelKind(m map[string]string, guild string) string {
-	switch m["channel_type"] {
-	case "1":
+func channelKind(value, guild string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "1", "DM":
 		return "dm"
-	case "3":
+	case "3", "GROUP_DM":
 		return "group"
+	case "0", "2", "4", "5", "6", "10", "11", "12", "13", "14", "15", "16",
+		"GUILD_TEXT", "GUILD_VOICE", "GUILD_CATEGORY", "GUILD_ANNOUNCEMENT", "GUILD_NEWS", "GUILD_STORE",
+		"ANNOUNCEMENT_THREAD", "PUBLIC_THREAD", "PRIVATE_THREAD", "GUILD_STAGE_VOICE", "GUILD_DIRECTORY", "GUILD_FORUM", "GUILD_MEDIA":
+		return "guild"
 	}
 	if guild != "" {
 		return "guild"
@@ -110,31 +78,81 @@ func activityCount(v string) int {
 	return int(min(integer(v), 1<<31-1))
 }
 
-func activitySentMessage(m map[string]string, source store.ActivitySource) (store.SentMessage, bool) {
-	if m["event_type"] != "send_message" || !digits(m["message_id"]) {
-		return store.SentMessage{}, false
-	}
+func activityRecord(m map[string]string, source store.ActivitySource) activityFacts {
 	channel, guild := activityChannel(m)
-	at, _ := eventTime(m["timestamp"])
-	eventID := m["event_id"]
-	if len(eventID) > 1024 {
-		eventID = ""
+	kind := channelKind(m["channel_type"], guild)
+	name := m["channel_name"]
+	title := ""
+	recipients := cmp.Or(m["recipient_ids"], m["recipients"])
+	if kind == "" && strings.EqualFold(m["private"], "true") {
+		kind = "unknown-dm"
+		if strings.Contains(recipients, "\n") {
+			kind = "group"
+		}
 	}
-	return store.SentMessage{
-		ID:          m["message_id"],
-		EventID:     eventID,
-		Channel:     channel,
-		Guild:       guild,
-		Kind:        activityChannelKind(m, guild),
-		Time:        at,
-		Platform:    platform(m["os"], m["browser"]),
-		Length:      activityCount(m["length"]),
-		Words:       activityCount(m["word_count"]),
-		URLs:        activityCount(m["num_urls"]),
-		Attachments: activityCount(m["num_attachments"]),
-		HasMedia:    attachmentMedia(m["attachment_content_types"], m["attachment_mimetypes"]),
-		Sources:     source,
-	}, true
+	if kind == "group" {
+		title = name
+		name = ""
+	}
+	facts := activityFacts{}
+	if channel != "" && (name != "" || guild != "" || m["guild_name"] != "" || kind != "" || title != "" || recipients != "") {
+		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: guild, Server: m["guild_name"], Kind: kind, Title: title, Recipients: recipients, Rank: 2}
+	}
+
+	at, hasTime := eventTime(m["timestamp"])
+	client := platform(m["os"], m["browser"])
+	eventKind := eventKinds[m["event_type"]]
+	if eventKind != 0 && hasTime {
+		e := store.Event{ID: m["event_id"], Kind: eventKind, Time: at, Guild: guild, Channel: channel, Platform: client}
+		if e.ID == "" {
+			e.ID = m["event_type"] + "\x00" + m["timestamp"] + "\x00" + channel
+		}
+		switch eventKind {
+		case store.EventVoice:
+			// Screen-share streams report their own disconnects inside the voice session that carries them.
+			if m["context"] != "stream" {
+				ms := integer(m["duration_connected_ms"])
+				if ms <= 0 {
+					ms = integer(m["duration"])
+				}
+				e.Duration = time.Duration(ms) * time.Millisecond
+				facts.Event = e
+			}
+		case store.EventGame:
+			e.Name = cmp.Or(m["application_name"], m["application_id"])
+			e.Duration = time.Duration(integer(m["activity_duration_s"])) * time.Second
+			e.Total = time.Duration(integer(m["total_duration_s"])) * time.Second
+			facts.Event = e
+		case store.EventReaction:
+			e.Name = m["emoji_name"]
+			facts.Event = e
+		default:
+			facts.Event = e
+		}
+	}
+
+	if m["event_type"] == "send_message" && digits(m["message_id"]) {
+		eventID := m["event_id"]
+		if len(eventID) > 1024 {
+			eventID = ""
+		}
+		facts.Sent = store.SentMessage{
+			ID:          m["message_id"],
+			EventID:     eventID,
+			Channel:     channel,
+			Guild:       guild,
+			Kind:        kind,
+			Time:        at,
+			Platform:    client,
+			Length:      activityCount(m["length"]),
+			Words:       activityCount(m["word_count"]),
+			URLs:        activityCount(m["num_urls"]),
+			Attachments: activityCount(m["num_attachments"]),
+			HasMedia:    attachmentMedia(m["attachment_content_types"], m["attachment_mimetypes"]),
+			Sources:     source,
+		}
+	}
+	return facts
 }
 
 // Analytics timestamps arrive as JSON strings that themselves contain quotes.

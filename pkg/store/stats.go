@@ -341,6 +341,13 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 	serverName := func(guild string) string { return cmp.Or(labels[guild].name, guild) }
 	channelBoards := func(c channel, guild, id string) []*Leader {
 		out := make([]*Leader, 0, 3)
+		conversation := c.kind == "dm" || c.kind == "unknown-dm" || c.kind == "group"
+		if conversation {
+			if id != "" {
+				out = append(out, people.get(id, channelLabel(c, id, lookup), c.kind))
+			}
+			return out
+		}
 		if guild != "" {
 			out = append(out, servers.get(guild, serverName(guild), "server"))
 		}
@@ -355,9 +362,6 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			ch := chans.get(id, label, cmp.Or(c.kind, "unknown"))
 			ch.Parent = guild
 			out = append(out, ch)
-			if c.kind == "dm" || c.kind == "unknown-dm" || c.kind == "group" {
-				out = append(out, people.get(id, channelLabel(c, id, lookup), c.kind))
-			}
 		}
 		return out
 	}

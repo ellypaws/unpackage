@@ -209,7 +209,11 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		var metadata []store.ChannelObservation
 		var events []store.Event
 		var sentMessages []store.SentMessage
-		observations := map[string]string{}
+		observations := map[store.ChannelObservation]bool{}
+		activityOrigin := store.ActivityOther
+		if f.category == 4 {
+			activityOrigin = activitySource(f.name)
+		}
 		reported := int64(0)
 		lastProgress := time.Now()
 		flushMessages := func() error {
@@ -300,15 +304,18 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					if gid == "" && digits(m["guild"]) {
 						gid = m["guild"]
 					}
-					kind := "unknown"
-					if gid != "" {
-						kind = "guild"
-					}
-					if m["type"] == "DM" || m["type"] == "1" {
+					kind := channelKind(m["type"], gid)
+					if kind == "" && m["recipients"] != "" {
 						kind = "dm"
+						if strings.Contains(m["recipients"], "\n") {
+							kind = "group"
+						}
+					}
+					if kind == "" {
+						kind = "unknown"
 					}
 					observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Rank: 3}
-					if m["type"] == "GROUP_DM" || m["type"] == "3" {
+					if kind == "group" {
 						observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: 3}
 					}
 					metadata = append(metadata, observation)
@@ -337,16 +344,14 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					return flushMessages()
 				}
 			case 4:
-				channel, guild := activityChannel(m)
-				if channel != "" && guild != "" {
-					key := channel
-					value := guild + "\x00" + m["guild_name"] + "\x00" + m["channel_name"]
-					if observations[key] != value {
+				facts := activityRecord(m, activityOrigin)
+				if observation := facts.Channel; observation.ID != "" {
+					if !observations[observation] {
 						if len(observations) >= 16384 {
 							clear(observations)
 						}
-						observations[key] = value
-						metadata = append(metadata, store.ChannelObservation{ID: channel, Name: m["channel_name"], Guild: guild, Server: m["guild_name"], Kind: "guild", Rank: 2})
+						observations[observation] = true
+						metadata = append(metadata, observation)
 						if len(metadata) >= 512 {
 							if e := flushMetadata(); e != nil {
 								return e
@@ -354,14 +359,14 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 						}
 					}
 				}
-				if event, ok := activityEvent(m); ok {
-					events = append(events, event)
+				if facts.Event.Kind != 0 {
+					events = append(events, facts.Event)
 					if len(events) >= 512 {
 						return flushEvents()
 					}
 				}
-				if sent, ok := activitySentMessage(m, activitySource(f.name)); ok {
-					sentMessages = append(sentMessages, sent)
+				if facts.Sent.ID != "" {
+					sentMessages = append(sentMessages, facts.Sent)
 					if len(sentMessages) >= 512 {
 						return flushSentMessages()
 					}
@@ -561,6 +566,9 @@ func label(v string) (string, string, string) {
 		if strings.Contains(v, "Unknown Participant") {
 			return v, "", "unknown-dm"
 		}
+		return v, "", "dm"
+	}
+	if name, ok := strings.CutPrefix(v, "@"); ok && strings.TrimSpace(name) != "" {
 		return v, "", "dm"
 	}
 	if i := strings.LastIndex(v, " in "); i >= 0 {

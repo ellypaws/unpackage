@@ -221,7 +221,11 @@ func (m *Model) statsAction(id string) (tea.Cmd, bool) {
 		}
 		return m.ensureStats(), true
 	}
-	if target, ok := strings.CutPrefix(id, "stats-open-"); ok {
+	target, open := strings.CutPrefix(id, "stats-open-")
+	if !open {
+		target, open = strings.CutPrefix(id, "stats-more-")
+	}
+	if open {
 		entity, key, _ := strings.Cut(target, "/")
 		metric, valid := store.ParseMetric(key)
 		if !valid {
@@ -608,9 +612,10 @@ func (m *Model) card(id, title, body string, width int) string {
 		title = "▸ " + title
 		border = components.Accent
 		titleColor = components.Accent
-		if m.Hover == id || m.Focus == id {
-			border = components.Pink
-			titleColor = components.Pink
+		moreID := "stats-more-" + strings.TrimPrefix(id, "stats-open-")
+		if m.Hover == id || m.Focus == id || m.Hover == moreID || m.Focus == moreID {
+			border = components.Cyan
+			titleColor = lipgloss.Color("#FFFFFF")
 		}
 	}
 	box := components.TitledBox(title, body, width, 1, lipgloss.RoundedBorder(), border, titleColor, m.Frame, false)
@@ -688,7 +693,14 @@ func (m *Model) boardCard(spec boardSpec, width int, limit int) string {
 		labelWidth := max(4, inner-lipgloss.Width(value)-1)
 		label = components.Fit(label, labelWidth)
 		line := label + strings.Repeat(" ", max(1, labelWidth-lipgloss.Width(label)+1)) + value
-		lines = append(lines, muted.Render(line))
+		cardID := "stats-open-" + string(spec.entity) + "/" + spec.metric.Key()
+		moreID := "stats-more-" + string(spec.entity) + "/" + spec.metric.Key()
+		style := lipgloss.NewStyle().Foreground(components.Accent).Bold(true)
+		if m.Hover == cardID || m.Focus == cardID || m.Hover == moreID || m.Focus == moreID {
+			style = style.Foreground(lipgloss.Color("#FFFFFF")).Background(components.SurfaceHover).Underline(true)
+		}
+		m.HoverOnly = append(m.HoverOnly, moreID)
+		lines = append(lines, m.Zones.Mark(moreID, style.Render(line)))
 	}
 	title := spec.title
 	if title == "" {

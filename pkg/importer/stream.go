@@ -70,6 +70,8 @@ func scalar(t json.Token) string {
 		return v
 	case json.Number:
 		return v.String()
+	case bool:
+		return strconv.FormatBool(v)
 	}
 	return ""
 }
@@ -89,7 +91,7 @@ func digits(v string) bool {
 	return true
 }
 
-var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true, "event_type": true, "event_id": true, "application_name": true, "application_id": true, "activity_duration_s": true, "total_duration_s": true, "duration": true, "duration_connected_ms": true, "os": true, "browser": true, "emoji_name": true, "context": true, "global_name": true, "channel": true, "channel_type": true, "server": true, "message_id": true, "length": true, "word_count": true, "num_urls": true, "num_attachments": true, "attachment_content_types": true, "attachment_mimetypes": true}
+var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "username": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true, "event_type": true, "event_id": true, "application_name": true, "application_id": true, "activity_duration_s": true, "total_duration_s": true, "duration": true, "duration_connected_ms": true, "os": true, "browser": true, "emoji_name": true, "context": true, "global_name": true, "channel": true, "channel_type": true, "server": true, "message_id": true, "length": true, "word_count": true, "num_urls": true, "num_attachments": true, "attachment_content_types": true, "attachment_mimetypes": true, "private": true, "recipient_ids": true}
 
 const attachmentURLsKey = "attachment_urls"
 
@@ -220,17 +222,26 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 				e = childErr
 				return nil, e
 			}
-			if value, ok := child["$"]; ok && value != "" && items < 128 && len(value) <= 256 {
+			value := child["$"]
+			if value == "" {
+				for _, key := range []string{"global_name", "username", "name", "id"} {
+					if child[key] != "" {
+						value = child[key]
+						break
+					}
+				}
+			}
+			if value != "" && items < 128 && len(value) <= 256 {
 				if items > 0 {
 					out["items"] += "\n"
 				}
 				out["items"] += value
 				items++
 			}
-			if value, ok := child["$"]; ok && attachmentPresent(value) {
+			if scalarValue, ok := child["$"]; ok && attachmentPresent(scalarValue) {
 				out["has_attachments"] = "1"
-				out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], value)
-				if attachmentMedia(value) {
+				out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], scalarValue)
+				if attachmentMedia(scalarValue) {
 					out["has_media"] = "1"
 				}
 			}
