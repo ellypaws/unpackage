@@ -74,12 +74,13 @@ func (e Entity) Metrics() []Metric {
 
 // StatsFilter narrows statistics to a time range and, for drill-down, to one channel, game, platform, or emoji.
 type StatsFilter struct {
-	From, Until time.Time
-	Guilds      []string
-	Channel     string
-	Game        string
-	Platform    string
-	Emoji       string
+	From, Until    time.Time
+	Guilds         []string
+	ExcludedGuilds []string
+	Channel        string
+	Game           string
+	Platform       string
+	Emoji          string
 }
 
 func (f StatsFilter) admitsMessages() bool { return f.Game == "" && f.Platform == "" && f.Emoji == "" }
@@ -324,6 +325,13 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 	for _, g := range f.Guilds {
 		guilds[g] = true
 	}
+	excludedGuilds := make(map[string]bool, len(f.ExcludedGuilds))
+	for _, g := range f.ExcludedGuilds {
+		excludedGuilds[g] = true
+	}
+	matchesGuild := func(guild string) bool {
+		return (len(guilds) == 0 || guilds[guild]) && !excludedGuilds[guild]
+	}
 	st := &Stats{From: f.From, Until: f.Until}
 	for i := range MetricCount {
 		st.Daily[i] = map[string]int{}
@@ -367,26 +375,34 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 		}
 		return nil
 	}
-	for slot, ms := range s.messages {
+	for slot := range 2 {
 		if !included(slot) || !f.admitsMessages() {
 			continue
 		}
-		for id, m := range ms {
+		for observed := range s.observedMessagesLocked(slot) {
 			if e := tick(); e != nil {
 				return nil, e
 			}
-			_, inNew := s.messages[1][id]
-			if same && slot == 0 && inNew {
+			m := observed.Message
+			if same && s.skipCombinedMessage(slot, m.ID) {
 				continue
+			}
+			sent := observed.Sent
+			if same {
+				sent = mergeSentMessage(sent, s.sent[1-slot][m.ID])
+			}
+			if m.Channel == "" {
+				m.Channel = sent.Channel
 			}
 			if f.Channel != "" && m.Channel != f.Channel {
 				continue
 			}
 			c := channels[m.Channel]
-			if len(guilds) > 0 && !guilds[c.guild] {
+			c = merge(c, channelObservation("", sent.Guild, "", "guild", "", "", 2))
+			if !matchesGuild(c.guild) {
 				continue
 			}
-			t, ok := SnowflakeTime(id)
+			t, ok := SnowflakeTime(m.ID)
 			if !ok {
 				continue
 			}
@@ -394,13 +410,14 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			if !f.contains(t) {
 				continue
 			}
-			missing := same && slot == 0 && !inNew
+			_, inNewRecord := s.messages[1][m.ID]
+			missing := same && slot == 0 && !inNewRecord
 			if st.FirstMessage.IsZero() || t.Before(st.FirstMessage) {
 				st.FirstMessage = t
 			}
-			words := len(strings.Fields(m.Content))
-			links := strings.Contains(m.Content, "http://") || strings.Contains(m.Content, "https://")
-			st.Characters += len(m.Content)
+			words := max(len(strings.Fields(m.Content)), sent.Words)
+			links := sent.URLs > 0 || strings.Contains(m.Content, "http://") || strings.Contains(m.Content, "https://")
+			st.Characters += max(len(m.Content), sent.Length)
 			st.add(MetricMessages, t, 1)
 			st.add(MetricWords, t, words)
 			for _, l := range channelBoards(c, c.guild, m.Channel) {
@@ -450,7 +467,7 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			seen[id] = true
 			c := channels[e.Channel]
 			guild := cmp.Or(e.Guild, c.guild)
-			if len(guilds) > 0 && !guilds[guild] || !f.admitsEvent(e) {
+			if !matchesGuild(guild) || !f.admitsEvent(e) {
 				continue
 			}
 			t := e.Time.In(time.Local)

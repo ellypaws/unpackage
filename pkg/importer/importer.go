@@ -208,6 +208,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		messageBytes := 0
 		var metadata []store.ChannelObservation
 		var events []store.Event
+		var sentMessages []store.SentMessage
 		observations := map[string]string{}
 		reported := int64(0)
 		lastProgress := time.Now()
@@ -242,6 +243,16 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			}
 			return e
 		}
+		flushSentMessages := func() error {
+			if len(sentMessages) == 0 {
+				return nil
+			}
+			e := s.SentMessages(ctx, slot, sentMessages)
+			if e == nil {
+				sentMessages = sentMessages[:0]
+			}
+			return e
+		}
 		progress := func() error {
 			if time.Since(lastProgress) < 150*time.Millisecond {
 				return ctx.Err()
@@ -258,6 +269,9 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				return e
 			}
 			if e := flushEvents(); e != nil {
+				return e
+			}
+			if e := flushSentMessages(); e != nil {
 				return e
 			}
 			publish(phase, false)
@@ -323,15 +337,16 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					return flushMessages()
 				}
 			case 4:
-				if digits(m["channel_id"]) && digits(m["guild_id"]) {
-					key := m["channel_id"]
-					value := m["guild_id"] + "\x00" + m["guild_name"] + "\x00" + m["channel_name"]
+				channel, guild := activityChannel(m)
+				if channel != "" && guild != "" {
+					key := channel
+					value := guild + "\x00" + m["guild_name"] + "\x00" + m["channel_name"]
 					if observations[key] != value {
 						if len(observations) >= 16384 {
 							clear(observations)
 						}
 						observations[key] = value
-						metadata = append(metadata, store.ChannelObservation{ID: m["channel_id"], Name: m["channel_name"], Guild: m["guild_id"], Server: m["guild_name"], Kind: "guild", Rank: 2})
+						metadata = append(metadata, store.ChannelObservation{ID: channel, Name: m["channel_name"], Guild: guild, Server: m["guild_name"], Kind: "guild", Rank: 2})
 						if len(metadata) >= 512 {
 							if e := flushMetadata(); e != nil {
 								return e
@@ -343,6 +358,12 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					events = append(events, event)
 					if len(events) >= 512 {
 						return flushEvents()
+					}
+				}
+				if sent, ok := activitySentMessage(m, activitySource(f.name)); ok {
+					sentMessages = append(sentMessages, sent)
+					if len(sentMessages) >= 512 {
+						return flushSentMessages()
 					}
 				}
 			}
@@ -411,7 +432,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		} else {
 			e = stream(g, record, field)
 		}
-		e = errors.Join(e, flushMessages(), flushMetadata(), flushEvents(), r.Close())
+		e = errors.Join(e, flushMessages(), flushMetadata(), flushEvents(), flushSentMessages(), r.Close())
 		if delta := g.bytes - reported; delta > 0 {
 			processed.Add(delta)
 		}

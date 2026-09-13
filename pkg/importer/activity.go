@@ -63,6 +63,66 @@ func activityEvent(m map[string]string) (store.Event, bool) {
 	return e, true
 }
 
+func activitySource(name string) store.ActivitySource {
+	for part := range strings.SplitSeq(strings.ToLower(name), "/") {
+		switch strings.TrimSuffix(part, ".json") {
+		case "reporting":
+			return store.ActivityReporting
+		case "tns":
+			return store.ActivityTNS
+		}
+	}
+	return store.ActivityOther
+}
+
+func activityChannel(m map[string]string) (string, string) {
+	channel := m["channel_id"]
+	if !digits(channel) {
+		channel = m["channel"]
+	}
+	guild := m["guild_id"]
+	if !digits(guild) {
+		guild = m["server"]
+	}
+	if !digits(channel) {
+		channel = ""
+	}
+	if !digits(guild) {
+		guild = ""
+	}
+	return channel, guild
+}
+
+func activityCount(v string) int {
+	return int(min(integer(v), 1<<31-1))
+}
+
+func activitySentMessage(m map[string]string, source store.ActivitySource) (store.SentMessage, bool) {
+	if m["event_type"] != "send_message" || !digits(m["message_id"]) {
+		return store.SentMessage{}, false
+	}
+	channel, guild := activityChannel(m)
+	at, _ := eventTime(m["timestamp"])
+	eventID := m["event_id"]
+	if len(eventID) > 1024 {
+		eventID = ""
+	}
+	return store.SentMessage{
+		ID:          m["message_id"],
+		EventID:     eventID,
+		Channel:     channel,
+		Guild:       guild,
+		Time:        at,
+		Platform:    platform(m["os"], m["browser"]),
+		Length:      activityCount(m["length"]),
+		Words:       activityCount(m["word_count"]),
+		URLs:        activityCount(m["num_urls"]),
+		Attachments: activityCount(m["num_attachments"]),
+		HasMedia:    attachmentMedia(m["attachment_content_types"], m["attachment_mimetypes"]),
+		Sources:     source,
+	}, true
+}
+
 // Analytics timestamps arrive as JSON strings that themselves contain quotes.
 func eventTime(v string) (time.Time, bool) {
 	v = strings.Trim(strings.TrimSpace(v), "\"")

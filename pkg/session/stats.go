@@ -16,7 +16,7 @@ var weekdays = []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
 
 // statsRange takes an optional trailing day count or "all" and returns the remaining arguments.
 func (s *Session) statsRange(args []string) (store.StatsFilter, []string) {
-	f := store.StatsFilter{Guilds: slices.Clone(s.Filter.Guilds)}
+	f := store.StatsFilter{Guilds: slices.Clone(s.Filter.Guilds), ExcludedGuilds: slices.Clone(s.Filter.ExcludedGuilds)}
 	days := 0
 	if n := len(args); n > 0 {
 		last := strings.ToLower(args[n-1])

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"iter"
 	"maps"
 	"slices"
 	"strconv"
@@ -19,6 +20,7 @@ type Store struct {
 	channels  [2]map[string]channel
 	byDate    [2]map[string][]string
 	events    [2]map[string]Event
+	sent      [2]map[string]SentMessage
 	names     [2]map[string]string
 	interned  map[string]string
 }
@@ -37,6 +39,14 @@ const (
 	EventDelete
 )
 
+type ActivitySource uint8
+
+const (
+	ActivityReporting ActivitySource = 1 << iota
+	ActivityTNS
+	ActivityOther
+)
+
 // Event is one analytics record kept for statistics; Duration is the voice or play time it reports.
 type Event struct {
 	ID              string
@@ -45,6 +55,17 @@ type Event struct {
 	Guild, Channel  string
 	Name, Platform  string
 	Duration, Total time.Duration
+}
+
+// SentMessage is the metadata Discord retains for a send_message analytics event.
+type SentMessage struct {
+	ID, EventID, Channel, Guild string
+	Time                        time.Time
+	Platform                    string
+	Length, Words               int
+	URLs, Attachments           int
+	HasMedia                    bool
+	Sources                     ActivitySource
 }
 type Message struct {
 	ID, Channel, Date, Content string
@@ -69,6 +90,16 @@ type Row struct {
 	HasAttachments bool     `json:"has_attachments"`
 	HasMedia       bool     `json:"has_media"`
 	AttachmentURLs []string `json:"-"`
+	MessageRecord  bool     `json:"message_record"`
+	SendEvent      bool     `json:"send_message_event"`
+	Sources        []string `json:"sources,omitempty"`
+	SendEventID    string   `json:"send_message_event_id,omitempty"`
+	SendTime       string   `json:"send_message_time,omitempty"`
+	Platform       string   `json:"platform,omitempty"`
+	ReportedLength int      `json:"reported_length"`
+	ReportedWords  int      `json:"reported_words"`
+	ReportedURLs   int      `json:"reported_urls"`
+	ReportedFiles  int      `json:"reported_attachments"`
 }
 type Group struct {
 	ID, Name string
@@ -77,7 +108,7 @@ type Group struct {
 }
 type Filter struct {
 	Mode, Search, Channel, Kind, Media string
-	Guilds, Dates                      []string
+	Guilds, ExcludedGuilds, Dates      []string
 	IncidentSeconds                    map[int64]int64
 	From, Until                        string
 	Limit, Offset                      int
@@ -113,6 +144,7 @@ func (s *Store) Clear(slot int) {
 	s.channels[slot] = nil
 	s.byDate[slot] = nil
 	s.events[slot] = nil
+	s.sent[slot] = nil
 	s.names[slot] = nil
 }
 func (s *Store) Reset(ctx context.Context, slot int) error {
@@ -129,6 +161,7 @@ func (s *Store) Reset(ctx context.Context, slot int) error {
 	s.channels[slot] = map[string]channel{}
 	s.byDate[slot] = map[string][]string{}
 	s.events[slot] = map[string]Event{}
+	s.sent[slot] = map[string]SentMessage{}
 	s.names[slot] = map[string]string{}
 	return nil
 }
@@ -230,6 +263,97 @@ func (s *Store) Events(ctx context.Context, slot int, events []Event) error {
 	return nil
 }
 
+func sourceNames(sources ActivitySource, messageRecord bool) []string {
+	n := 0
+	if messageRecord {
+		n++
+	}
+	for _, source := range []ActivitySource{ActivityReporting, ActivityTNS, ActivityOther} {
+		if sources&source != 0 {
+			n++
+		}
+	}
+	labels := make([]string, 0, n)
+	if messageRecord {
+		labels = append(labels, "Messages")
+	}
+	if sources&ActivityReporting != 0 {
+		labels = append(labels, "Activity/reporting")
+	}
+	if sources&ActivityTNS != 0 {
+		labels = append(labels, "Activity/tns")
+	}
+	if sources&ActivityOther != 0 {
+		labels = append(labels, "Activity")
+	}
+	return labels
+}
+
+func mergeText(a, b string) string {
+	if a == "" || b != "" && strings.Compare(b, a) < 0 {
+		return b
+	}
+	return a
+}
+
+func mergeDescription(a, b string) string {
+	if len(b) > len(a) || len(b) == len(a) && strings.Compare(b, a) < 0 {
+		return b
+	}
+	return a
+}
+
+func mergeSentMessage(a, b SentMessage) SentMessage {
+	a.ID = cmp.Or(a.ID, b.ID)
+	a.EventID = mergeText(a.EventID, b.EventID)
+	a.Channel = mergeText(a.Channel, b.Channel)
+	a.Guild = mergeText(a.Guild, b.Guild)
+	a.Platform = mergeDescription(a.Platform, b.Platform)
+	if a.Time.IsZero() || !b.Time.IsZero() && b.Time.Before(a.Time) {
+		a.Time = b.Time
+	}
+	a.Length = max(a.Length, b.Length)
+	a.Words = max(a.Words, b.Words)
+	a.URLs = max(a.URLs, b.URLs)
+	a.Attachments = max(a.Attachments, b.Attachments)
+	a.HasMedia = a.HasMedia || b.HasMedia
+	a.Sources |= b.Sources
+	return a
+}
+
+// SentMessages merges repeated send_message records from Activity files by message ID.
+func (s *Store) SentMessages(ctx context.Context, slot int, messages []SentMessage) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sent[slot] == nil {
+		return fmt.Errorf("slot is not open")
+	}
+	for _, message := range messages {
+		if !digits(message.ID) {
+			continue
+		}
+		if s.interned == nil {
+			s.interned = map[string]string{}
+		}
+		message.Channel = s.intern(message.Channel)
+		message.Guild = s.intern(message.Guild)
+		message.Platform = s.intern(message.Platform)
+		_, alreadySent := s.sent[slot][message.ID]
+		s.sent[slot][message.ID] = mergeSentMessage(s.sent[slot][message.ID], message)
+		if _, hasRecord := s.messages[slot][message.ID]; !hasRecord && !alreadySent {
+			day := LocalDate(Day(message.ID))
+			s.byDate[slot][day] = append(s.byDate[slot][day], message.ID)
+		}
+	}
+	if snapshot := s.snapshots[slot]; snapshot != nil {
+		snapshot.Count = int64(s.messageCountLocked(slot))
+	}
+	return nil
+}
+
 // Analytics files repeat the same guild, channel, and application strings millions of times.
 func (s *Store) intern(v string) string {
 	if v == "" {
@@ -247,9 +371,20 @@ func (s *Store) SetSnapshot(slot int, v Snapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v.Slot = slot
-	v.Count = int64(len(s.messages[slot]))
+	v.Count = int64(s.messageCountLocked(slot))
 	s.snapshots[slot] = &v
 }
+
+func (s *Store) messageCountLocked(slot int) int {
+	count := len(s.messages[slot])
+	for id := range s.sent[slot] {
+		if _, ok := s.messages[slot][id]; !ok {
+			count++
+		}
+	}
+	return count
+}
+
 func (s *Store) Add(ctx context.Context, slot int, ms []Message) error {
 	if e := ctx.Err(); e != nil {
 		return e
@@ -265,10 +400,12 @@ func (s *Store) Add(ctx context.Context, slot int, ms []Message) error {
 	}
 	for _, m := range ms {
 		s.messages[slot][m.ID] = m
-		day := LocalDate(m.Date)
-		s.byDate[slot][day] = append(s.byDate[slot][day], m.ID)
+		if _, indexed := s.sent[slot][m.ID]; !indexed {
+			day := LocalDate(m.Date)
+			s.byDate[slot][day] = append(s.byDate[slot][day], m.ID)
+		}
 	}
-	s.snapshots[slot].Count = int64(len(s.messages[slot]))
+	s.snapshots[slot].Count = int64(s.messageCountLocked(slot))
 	return nil
 }
 func merge(a, b channel) channel {
@@ -434,6 +571,67 @@ func (s *Store) Compatible(ctx context.Context) (bool, string) {
 	defer s.mu.RUnlock()
 	return compatible(s.snapshots[0], s.snapshots[1])
 }
+
+type observedMessage struct {
+	Message
+	Sent          SentMessage
+	MessageRecord bool
+}
+
+func (s *Store) observedMessageLocked(slot int, id string) (observedMessage, bool) {
+	m, messageRecord := s.messages[slot][id]
+	sent, sendEvent := s.sent[slot][id]
+	if !messageRecord && !sendEvent {
+		return observedMessage{}, false
+	}
+	if !messageRecord {
+		m = Message{ID: id, Channel: sent.Channel, Date: Day(id), HasAttachments: sent.Attachments > 0, HasMedia: sent.HasMedia}
+	} else {
+		m.HasAttachments = m.HasAttachments || sent.Attachments > 0
+		m.HasMedia = m.HasMedia || sent.HasMedia
+	}
+	return observedMessage{Message: m, Sent: sent, MessageRecord: messageRecord}, true
+}
+
+func (s *Store) observedMessagesLocked(slot int) iter.Seq[observedMessage] {
+	return func(yield func(observedMessage) bool) {
+		for id := range s.messages[slot] {
+			message, _ := s.observedMessageLocked(slot, id)
+			if !yield(message) {
+				return
+			}
+		}
+		for id := range s.sent[slot] {
+			if _, ok := s.messages[slot][id]; ok {
+				continue
+			}
+			message, _ := s.observedMessageLocked(slot, id)
+			if !yield(message) {
+				return
+			}
+		}
+	}
+}
+
+func (s *Store) hasObservedMessageLocked(slot int, id string) bool {
+	_, inMessages := s.messages[slot][id]
+	_, inActivity := s.sent[slot][id]
+	return inMessages || inActivity
+}
+
+// skipCombinedMessage chooses one copy for an account represented by two packages.
+// A Messages record wins over analytics-only evidence, then the newer copy wins.
+func (s *Store) skipCombinedMessage(slot int, id string) bool {
+	_, oldRecord := s.messages[0][id]
+	_, newRecord := s.messages[1][id]
+	oldObserved := s.hasObservedMessageLocked(0, id)
+	newObserved := s.hasObservedMessageLocked(1, id)
+	if slot == 0 {
+		return newRecord || !oldRecord && newObserved
+	}
+	return oldRecord && !newRecord && oldObserved
+}
+
 func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	if e := ctx.Err(); e != nil {
 		return nil, e
@@ -484,13 +682,15 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		return nil, fmt.Errorf("unknown media filter %q", f.Media)
 	}
 	type item struct {
-		m       Message
-		c       channel
-		name    string
-		missing bool
+		m             Message
+		sent          SentMessage
+		c             channel
+		name          string
+		messageRecord bool
+		missing       bool
 	}
 	var items []item
-	for slot, ms := range s.messages {
+	for slot := range 2 {
 		labelled := map[string]string{}
 		if mode == "older" && slot != 0 || mode == "newer" && slot != 1 || mode == "new" && slot != 1 || (mode == "missing" || mode == "present") && slot != 0 {
 			continue
@@ -498,9 +698,9 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		if mode == "all" && !same && ((a != nil && slot != 0) || (a == nil && slot != 1)) {
 			continue
 		}
-		candidates := maps.Values(ms)
+		candidates := s.observedMessagesLocked(slot)
 		if len(windows) > 0 || f.From != "" || f.Until != "" || len(incidentSeconds) > 0 {
-			candidates = func(yield func(Message) bool) {
+			candidates = func(yield func(observedMessage) bool) {
 				for day, ids := range s.byDate[slot] {
 					if ctx.Err() != nil {
 						return
@@ -515,42 +715,53 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 						continue
 					}
 					for _, id := range ids {
-						if !yield(ms[id]) {
+						message, ok := s.observedMessageLocked(slot, id)
+						if ok && !yield(message) {
 							return
 						}
 					}
 				}
 			}
 		}
-		for m := range candidates {
+		for observed := range candidates {
 			if len(items)%1024 == 0 {
 				if e := ctx.Err(); e != nil {
 					s.mu.RUnlock()
 					return nil, e
 				}
 			}
+			m := observed.Message
 			if len(incidentSeconds) > 0 {
 				created, err := time.Parse(time.RFC3339Nano, m.Date)
 				if err != nil || !incidentSeconds[created.Unix()] {
 					continue
 				}
 			}
-			_, inOld := s.messages[0][m.ID]
-			_, inNew := s.messages[1][m.ID]
-			if mode == "missing" && inNew || mode == "present" && !inNew || mode == "new" && inOld || mode == "all" && same && slot == 0 && inNew {
+			_, inOldRecord := s.messages[0][m.ID]
+			_, inNewRecord := s.messages[1][m.ID]
+			inOld := s.hasObservedMessageLocked(0, m.ID)
+			if mode == "missing" && inNewRecord || mode == "present" && (!inOldRecord || !inNewRecord) || mode == "new" && inOld || mode == "all" && same && s.skipCombinedMessage(slot, m.ID) {
 				continue
+			}
+			sent := observed.Sent
+			if same {
+				sent = mergeSentMessage(sent, s.sent[1-slot][m.ID])
+			}
+			if m.Channel == "" {
+				m.Channel = sent.Channel
 			}
 			c := s.channels[slot][m.Channel]
 			if same {
 				c = merge(s.channels[0][m.Channel], s.channels[1][m.Channel])
 			}
+			c = merge(c, channelObservation("", sent.Guild, "", "guild", "", "", 2))
 			c = applyServerLabel(c, labels)
 			name, cached := labelled[m.Channel]
 			if !cached {
 				name = channelLabel(c, m.Channel, lookup)
 				labelled[m.Channel] = name
 			}
-			items = append(items, item{m: m, c: c, name: name, missing: same && slot == 0 && !inNew})
+			items = append(items, item{m: m, sent: sent, c: c, name: name, messageRecord: observed.MessageRecord, missing: same && slot == 0 && !inNewRecord})
 		}
 	}
 	s.mu.RUnlock()
@@ -571,7 +782,8 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			c.guild = ""
 			c.kind = "conflict"
 		}
-		if len(f.Guilds) > 0 && !slices.Contains(f.Guilds, c.guild) || f.Channel != "" && f.Channel != m.Channel || f.Kind != "" && f.Kind != c.kind || f.Media == "attachments" && !m.HasAttachments || f.Media == "media" && !m.HasMedia || search != "" && !strings.Contains(strings.ToLower(m.Content), search) {
+		guildIncluded := len(f.Guilds) == 0 || slices.Contains(f.Guilds, c.guild)
+		if !guildIncluded || slices.Contains(f.ExcludedGuilds, c.guild) || f.Channel != "" && f.Channel != m.Channel || f.Kind != "" && f.Kind != c.kind || f.Media == "attachments" && !m.HasAttachments || f.Media == "media" && !m.HasMedia || search != "" && !strings.Contains(strings.ToLower(m.Content), search) {
 			continue
 		}
 		server := c.server
@@ -592,8 +804,14 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			status = "missing"
 		} else if mode == "present" || mode == "new" {
 			status = mode
+		} else if !v.messageRecord {
+			status = "send event only"
 		}
-		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: v.name, Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs)})
+		sendTime := ""
+		if !v.sent.Time.IsZero() {
+			sendTime = v.sent.Time.Format(time.RFC3339Nano)
+		}
+		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: v.name, Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs), MessageRecord: v.messageRecord, SendEvent: v.sent.ID != "", Sources: sourceNames(v.sent.Sources, v.messageRecord), SendEventID: v.sent.EventID, SendTime: sendTime, Platform: v.sent.Platform, ReportedLength: v.sent.Length, ReportedWords: v.sent.Words, ReportedURLs: v.sent.URLs, ReportedFiles: v.sent.Attachments})
 	}
 	slices.SortFunc(rows, func(a, b Row) int {
 		return cmp.Or(strings.Compare(a.Date, b.Date), cmp.Compare(len(a.ID), len(b.ID)), strings.Compare(a.ID, b.ID))

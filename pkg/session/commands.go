@@ -27,9 +27,11 @@ stop                       Stop loading
 status                     Import and identity status
 mode auto|missing|all|older|newer|present|new
 servers                    List observed servers
-select ID [ID ...]          Filter several servers
-select all                 Clear server selection
+select ID [ID ...]          Include servers
+exclude ID [ID ...]         Exclude servers
+select all                 Clear included and excluded servers
 dates "2022-11-19; 1,396 days ago"
+dates "1700000000; 1700000060"   Exact unix seconds
 dates clear                Clear selected days
 margin BEFORE AFTER        Include days around each selected date
 last N                     Last N days, including today
@@ -53,7 +55,8 @@ help                       Command reference
 quit                       Exit
 
 CLI: package diff OLDER NEWER [options]
-  --server ID   --date "days or date"   --search TEXT
+  --server ID   --exclude-server ID
+  --date "days, date, or unix time"   --search TEXT
   --media all|attachments|media
   --before-days N   --after-days N
   --mode MODE   --format jsonl|tsv
@@ -62,9 +65,9 @@ package repl
 package sample DIRECTORY [MESSAGE_COUNT]
 
 Dates use local time. Quote paths with spaces.
-Statistics commands use the selected servers and combine both packages.
+Statistics commands use the included and excluded servers and combine both packages.
 Use Paste from clipboard in Investigate to filter exact incident seconds.
-Request requires selected server IDs; all ignores other filters.
+Request requires an included or excluded server; all ignores other filters.
 Missing means absent from the newer export, not proof of deletion.`
 
 func StyledHelp() string {
@@ -157,6 +160,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		}
 		if arg == "all" {
 			s.Filter.Guilds = nil
+			s.Filter.ExcludedGuilds = nil
 		} else {
 			for _, id := range a[1:] {
 				if _, e := strconv.ParseUint(id, 10, 64); e != nil {
@@ -164,19 +168,32 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 				}
 			}
 			s.Filter.Guilds = slices.Clone(a[1:])
+			s.Filter.ExcludedGuilds = slices.DeleteFunc(s.Filter.ExcludedGuilds, func(id string) bool { return slices.Contains(s.Filter.Guilds, id) })
 		}
+		s.Filter.Offset = 0
+	case "exclude":
+		if len(a) < 2 {
+			return fmt.Errorf("specify server IDs")
+		}
+		for _, id := range a[1:] {
+			if _, e := strconv.ParseUint(id, 10, 64); e != nil {
+				return fmt.Errorf("server exclusion requires numeric IDs")
+			}
+		}
+		s.Filter.ExcludedGuilds = slices.Clone(a[1:])
+		s.Filter.Guilds = slices.DeleteFunc(s.Filter.Guilds, func(id string) bool { return slices.Contains(s.Filter.ExcludedGuilds, id) })
 		s.Filter.Offset = 0
 	case "dates":
 		if arg == "clear" {
 			s.Filter.Dates = nil
 			s.Filter.IncidentSeconds = nil
 		} else {
-			d, e := Dates(arg, s.Today)
+			d, seconds, e := Dates(arg, s.Today)
 			if e != nil {
 				return e
 			}
 			s.Filter.Dates = d
-			s.Filter.IncidentSeconds = nil
+			s.Filter.IncidentSeconds = seconds
 		}
 		s.Filter.From = ""
 		s.Filter.Until = ""
@@ -326,11 +343,11 @@ func (s *Session) Output(ctx context.Context, f store.Filter, format string, w i
 	}
 	c := csv.NewWriter(w)
 	c.Comma = '\t'
-	if e := c.Write([]string{"server_id", "server", "channel_id", "channel", "message_id", "date", "status", "has_attachments", "has_media", "content"}); e != nil {
+	if e := c.Write([]string{"server_id", "server", "channel_id", "channel", "message_id", "date", "status", "sources", "has_message_record", "has_send_event", "send_event_id", "send_event_time", "platform", "reported_length", "reported_words", "reported_urls", "reported_attachments", "has_attachments", "has_media", "content"}); e != nil {
 		return e
 	}
 	e := s.Store.Each(ctx, f, func(r store.Row) error {
-		return c.Write([]string{r.Guild, Safe(r.Server), r.Channel, Safe(r.Name), r.ID, r.Date, r.Status, strconv.FormatBool(r.HasAttachments), strconv.FormatBool(r.HasMedia), Safe(r.Content)})
+		return c.Write([]string{r.Guild, Safe(r.Server), r.Channel, Safe(r.Name), r.ID, r.Date, r.Status, strings.Join(r.Sources, ","), strconv.FormatBool(r.MessageRecord), strconv.FormatBool(r.SendEvent), r.SendEventID, r.SendTime, Safe(r.Platform), strconv.Itoa(r.ReportedLength), strconv.Itoa(r.ReportedWords), strconv.Itoa(r.ReportedURLs), strconv.Itoa(r.ReportedFiles), strconv.FormatBool(r.HasAttachments), strconv.FormatBool(r.HasMedia), Safe(r.Content)})
 	})
 	c.Flush()
 	if e != nil {
@@ -352,8 +369,8 @@ func (s *Session) Request(ctx context.Context, dest, scope string) (int, error) 
 	if s.Busy() {
 		return 0, fmt.Errorf("wait for imports before exporting a request")
 	}
-	if len(s.Filter.Guilds) == 0 {
-		return 0, fmt.Errorf("select at least one server ID")
+	if len(s.Filter.Guilds) == 0 && len(s.Filter.ExcludedGuilds) == 0 {
+		return 0, fmt.Errorf("include or exclude at least one server ID")
 	}
 	ss, e := s.Store.Snapshots(ctx)
 	if e != nil {
@@ -371,17 +388,23 @@ func (s *Session) Request(ctx context.Context, dest, scope string) (int, error) 
 	f := s.Filter
 	f.Limit = 0
 	f.Offset = 0
+	if len(f.Guilds) == 0 {
+		f.Kind = "guild"
+	}
 	if scope == "all" {
 		groups, e := s.Store.Groups(ctx, store.Filter{Mode: "all"}, false)
 		if e != nil {
 			return 0, e
 		}
-		for _, id := range f.Guilds {
+		for _, id := range append(slices.Clone(f.Guilds), f.ExcludedGuilds...) {
 			if !slices.ContainsFunc(groups, func(g store.Group) bool { return g.ID == id }) {
-				return 0, fmt.Errorf("selected server %s has no resolved message IDs", id)
+				return 0, fmt.Errorf("server %s has no resolved message IDs", id)
 			}
 		}
-		f = store.Filter{Mode: "all", Guilds: slices.Clone(s.Filter.Guilds)}
+		f = store.Filter{Mode: "all", Guilds: slices.Clone(s.Filter.Guilds), ExcludedGuilds: slices.Clone(s.Filter.ExcludedGuilds)}
+		if len(f.Guilds) == 0 {
+			f.Kind = "guild"
+		}
 	} else if scope != "filtered" {
 		return 0, fmt.Errorf("request scope must be all or filtered")
 	}

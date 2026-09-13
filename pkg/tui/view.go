@@ -177,7 +177,7 @@ func (m *Model) View() string {
 	}
 	if m.FilterDialog {
 		body := m.filters(34)
-		if len(m.Session.Filter.Guilds) > 0 {
+		if len(m.Session.Filter.Guilds) > 0 || len(m.Session.Filter.ExcludedGuilds) > 0 {
 			body += "\n\n" + m.button("draft", "Deletion request", false)
 		}
 		body += "\n" + m.button("filters-close", "Done", true)
@@ -188,11 +188,11 @@ func (m *Model) View() string {
 	}
 	if m.RequestDialog {
 		width := min(w-6, 70)
-		scope := "All messages in selected servers"
+		scope := "All messages in the server selection"
 		if m.RequestScope == "filtered" {
 			scope = "Current matching messages"
 		}
-		body := fmt.Sprintf("%d servers selected", len(m.Session.Filter.Guilds)) + "\n\n" + m.button("scope", scope, false) + "\n\n" + m.field("request-path", &m.RequestInput, width) + "\n\n" + m.button("request-close", "Cancel", false)
+		body := serverSelectionLabel(m.Session.Filter.Guilds, m.Session.Filter.ExcludedGuilds) + "\n\n" + m.button("scope", scope, false) + "\n\n" + m.field("request-path", &m.RequestInput, width) + "\n\n" + m.button("request-close", "Cancel", false)
 		if status := m.statusLine(width); status != "" {
 			body += "\n\n" + status
 		}
@@ -217,7 +217,11 @@ func (m *Model) View() string {
 		}
 		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text))
 		if strings.TrimSpace(r.Content) == "" {
-			messageContent = lipgloss.NewStyle().Foreground(components.Muted).Render("No text content")
+			unavailable := "No text content"
+			if r.SendEvent && !r.MessageRecord {
+				unavailable = "Content is not included in the send_message analytics event."
+			}
+			messageContent = lipgloss.NewStyle().Foreground(components.Muted).Render(unavailable)
 		}
 		attachments := lipgloss.NewStyle().Foreground(components.Muted).Render("None")
 		if len(r.AttachmentURLs) > 0 {
@@ -236,7 +240,20 @@ func (m *Model) View() string {
 			attachmentKind = "Attachment"
 		}
 		dateDetails := lipgloss.NewStyle().Foreground(components.Muted).Render("Date        " + fullDateTime(r.Date) + "\nAge         " + relativeDate(r.Date, m.Session.Today) + "\nElapsed     " + calendarAge(r.Date, m.Session.Today))
-		metadata := lipgloss.NewStyle().Foreground(components.Muted).Render("Status      " + r.Status + "\nAttachment  " + attachmentKind + "\nServer ID   " + r.Guild + "\nChannel ID  " + r.Channel + "\nMessage ID  " + r.ID)
+		metadataLines := []string{"Status      " + r.Status, "Sources     " + strings.Join(r.Sources, ", "), "Attachment  " + attachmentKind, "Server ID   " + r.Guild, "Channel ID  " + r.Channel, "Message ID  " + r.ID}
+		if r.SendEvent {
+			if r.SendTime != "" {
+				metadataLines = append(metadataLines, "Event time  "+fullDateTime(r.SendTime))
+			}
+			if r.SendEventID != "" {
+				metadataLines = append(metadataLines, "Event ID    "+r.SendEventID)
+			}
+			if r.Platform != "" {
+				metadataLines = append(metadataLines, "Client      "+r.Platform)
+			}
+			metadataLines = append(metadataLines, fmt.Sprintf("Reported    %s characters, %s words, %s URLs, %s attachments", number(r.ReportedLength), number(r.ReportedWords), number(r.ReportedURLs), number(r.ReportedFiles)))
+		}
+		metadata := lipgloss.NewStyle().Foreground(components.Muted).Render(strings.Join(metadataLines, "\n"))
 		contentWidth := max(1, w-4)
 		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + dateDetails + "\n\n" + components.TitleRule("Message content", contentWidth, m.Frame, false) + "\n" + messageContent + "\n\n" + components.TitleRule("Attachments", contentWidth, m.Frame, false) + "\n" + attachments + "\n\n" + metadata
 		m.Viewport.SetContent(lipgloss.NewStyle().Width(w - 4).Render(content))
@@ -528,14 +545,8 @@ func (m *Model) filters(w int) string {
 	parts = append(parts, m.button("margin", components.Fit(margin, w-3), f.DateBefore > 0 || f.DateAfter > 0))
 	media := optionLabel(mediaOptions, f.Media)
 	parts = append(parts, m.dropdown("media", components.Fit(media, w-5), f.Media != ""))
-	servers := "All servers"
-	if len(f.Guilds) > 0 {
-		servers = fmt.Sprintf("%d servers selected", len(f.Guilds))
-		if len(f.Guilds) == 1 {
-			servers = "1 server selected"
-		}
-	}
-	parts = append(parts, m.button("servers", servers, len(f.Guilds) > 0)+" "+m.button("clear", "Reset", false))
+	servers := serverSelectionLabel(f.Guilds, f.ExcludedGuilds)
+	parts = append(parts, m.button("servers", servers, len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0)+" "+m.button("clear", "Reset", false))
 	if f.Channel != "" {
 		parts = append(parts, m.button("channel-clear", components.Fit("Channel: "+cmp.Or(m.ChannelLabel, f.Channel)+" ×", w-3), true))
 	}
@@ -543,7 +554,7 @@ func (m *Model) filters(w int) string {
 }
 func (m *Model) filterPanel(w, h int) string {
 	top := m.filters(w)
-	if len(m.Session.Filter.Guilds) == 0 {
+	if len(m.Session.Filter.Guilds) == 0 && len(m.Session.Filter.ExcludedGuilds) == 0 {
 		return top
 	}
 	request := components.Title.Render("Request") + "\n" + m.button("draft", "Deletion request", false)
@@ -666,7 +677,7 @@ func (m *Model) messages(w, h int) string {
 	for i, r := range m.Rows[:visible] {
 		id := fmt.Sprintf("row-%d", i)
 		serverID := fmt.Sprintf("row-server-%d", i)
-		eligible := r.Guild != "" && (len(m.Session.Filter.Guilds) != 1 || m.Session.Filter.Guilds[0] != r.Guild)
+		eligible := r.Guild != "" && (len(m.Session.Filter.Guilds) != 1 || m.Session.Filter.Guilds[0] != r.Guild || len(m.Session.Filter.ExcludedGuilds) > 0)
 		distance := -1
 		if active >= 0 {
 			distance = i - active
@@ -713,12 +724,7 @@ func (m *Model) messages(w, h int) string {
 			meta += " " + action
 		}
 		contentWidth := listWidth - 4
-		preview := r.Content
-		if preview == "" && r.HasMedia {
-			preview = "Media attachment"
-		} else if preview == "" && r.HasAttachments {
-			preview = "Attachment"
-		}
+		preview := messagePreview(r)
 		excerpt := components.SearchExcerpt(preview, m.Session.Filter.Search, contentWidth)
 		content := components.Highlight(excerpt, m.Session.Filter.Search, contentStyle)
 		rows = append(rows, m.Zones.Mark(id, rowStyle.Render(meta+"\n"+content)))
@@ -732,6 +738,22 @@ func (m *Model) messages(w, h int) string {
 	}
 	bar := m.scrollbar(total, visible, max(lipgloss.Height(list), h))
 	return lipgloss.JoinHorizontal(lipgloss.Top, list, " ", bar)
+}
+
+func messagePreview(r store.Row) string {
+	if r.Content != "" {
+		return r.Content
+	}
+	if r.SendEvent && !r.MessageRecord {
+		return "Content unavailable, recovered from a send_message event"
+	}
+	if r.HasMedia {
+		return "Media attachment"
+	}
+	if r.HasAttachments {
+		return "Attachment"
+	}
+	return ""
 }
 func (m *Model) resultCount() int {
 	total := 0
@@ -773,8 +795,22 @@ func (m *Model) scrollbarView(prefix string, offset, total, visible, height int)
 	}
 	return strings.Join(lines, "\n")
 }
+func serverSelectionLabel(included, excluded []string) string {
+	if len(included) == 0 && len(excluded) == 0 {
+		return "All servers"
+	}
+	parts := make([]string, 0, 2)
+	if len(included) > 0 {
+		parts = append(parts, fmt.Sprintf("%d included", len(included)))
+	}
+	if len(excluded) > 0 {
+		parts = append(parts, fmt.Sprintf("%d excluded", len(excluded)))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (m *Model) serverColumns() int  { return max(1, min(3, (min(m.Width-10, 120)+2)/38)) }
-func (m *Model) serverPageSize() int { return max(1, (m.Height-15)/2) * m.serverColumns() }
+func (m *Model) serverPageSize() int { return max(1, (m.Height-16)/2) * m.serverColumns() }
 func (m *Model) filteredServers() []store.Group {
 	var out []store.Group
 	query := strings.ToLower(m.ServerSearch)
@@ -789,10 +825,11 @@ func (m *Model) servers() string {
 	w := min(m.Width-10, 120)
 	groups := m.filteredServers()
 	m.ServerOffset = min(m.ServerOffset, max(0, ((len(groups)-1)/m.serverPageSize())*m.serverPageSize()))
-	selected := *m.targetGuilds()
+	included, excluded := m.targetGuilds()
 	top := m.field("servers-input", &m.ServerInput, min(w, 38)) + "\n"
 	top += m.button("servers-close", "Done", true) + " " + m.button("servers-clear", "Clear selection", false) + " " + m.dropdown("servers-sort", optionLabel(serverSorts, m.ServerSort), m.ServerSort != "messages") + " " + m.button("servers-prev", "‹", false) + " " + m.button("servers-next", "›", false)
-	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(fmt.Sprintf("%d matches, %d selected", len(groups), len(selected))) + "\n"
+	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(fmt.Sprintf("%d matches, %s", len(groups), strings.ToLower(serverSelectionLabel(*included, *excluded))))
+	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render("Activate to cycle: include, exclude, any") + "\n"
 	if m.ServerInput.Value() != m.ServerSearch {
 		top += components.Working("Searching servers…", m.Frame, w) + "\n"
 	}
@@ -815,16 +852,22 @@ func (m *Model) servers() string {
 		g := groups[i]
 		id := "server-" + g.ID
 		m.Actions = append(m.Actions, id)
-		chosen := slices.Contains(selected, g.ID)
+		include := slices.Contains(*included, g.ID)
+		exclude := slices.Contains(*excluded, g.ID)
 		mark := "[ ] "
-		if chosen {
-			mark = "[x] "
+		if include {
+			mark = "[+] "
+		} else if exclude {
+			mark = "[-] "
 		}
 		style := lipgloss.NewStyle().Foreground(components.Text)
 		boxStyle := lipgloss.NewStyle().Width(cellWidth-2).Padding(0, 1)
-		if chosen {
+		if include {
 			boxStyle = boxStyle.Background(components.Surface)
 			style = style.Foreground(components.Accent).Bold(true)
+		} else if exclude {
+			boxStyle = boxStyle.Background(components.Surface)
+			style = style.Foreground(components.Deleted).Bold(true)
 		}
 		if m.Hover == id || m.Focus == id {
 			boxStyle = boxStyle.Background(components.SurfaceHover)

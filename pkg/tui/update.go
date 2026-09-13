@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -10,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/ellypaws/unpackage/pkg/clipboard"
 	"github.com/ellypaws/unpackage/pkg/components"
 	"github.com/ellypaws/unpackage/pkg/importer"
 	"github.com/ellypaws/unpackage/pkg/session"
@@ -750,15 +751,15 @@ func (m *Model) action(id string) tea.Cmd {
 		return m.refresh()
 	}
 	if g, ok := strings.CutPrefix(id, "server-"); ok {
-		target := m.targetGuilds()
-		ids := *target
-		i := slices.Index(ids, g)
-		if i >= 0 {
-			ids = slices.Delete(ids, i, i+1)
+		included, excluded := m.targetGuilds()
+		if i := slices.Index(*included, g); i >= 0 {
+			*included = slices.Delete(*included, i, i+1)
+			*excluded = append(*excluded, g)
+		} else if i := slices.Index(*excluded, g); i >= 0 {
+			*excluded = slices.Delete(*excluded, i, i+1)
 		} else {
-			ids = append(ids, g)
+			*included = append(*included, g)
 		}
-		*target = ids
 		if m.ServerTarget == "stats" {
 			return m.statsChanged()
 		}
@@ -773,6 +774,7 @@ func (m *Model) action(id string) tea.Cmd {
 			return nil
 		}
 		m.Session.Filter.Guilds = []string{m.Rows[n].Guild}
+		m.Session.Filter.ExcludedGuilds = nil
 		m.Focus = "row-0"
 		return m.changed()
 	}
@@ -841,9 +843,11 @@ func (m *Model) action(id string) tea.Cmd {
 		m.IncidentProcessing = "Reading clipboard…"
 		m.Notice = ""
 		return func() tea.Msg {
-			text, err := clipboard.ReadAll()
+			ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+			defer cancel()
+			text, err := clipboard.Read(ctx)
 			if err != nil {
-				return incidentInputMsg{Clipboard: true, Err: fmt.Errorf("read clipboard: %w", err), Revision: revision}
+				return incidentInputMsg{Clipboard: true, Err: fmt.Errorf("read clipboard: %w. Type unix times in the date box instead", err), Revision: revision}
 			}
 			seconds, recognized, err := importer.IncidentSecondsJSON([]byte(text))
 			return incidentInputMsg{Seconds: seconds, Recognized: recognized, Clipboard: true, Err: err, Revision: revision}
@@ -868,7 +872,7 @@ func (m *Model) action(id string) tea.Cmd {
 			m.RequestScope = "all"
 		}
 	case "draft":
-		if len(m.Session.Filter.Guilds) == 0 {
+		if len(m.Session.Filter.Guilds) == 0 && len(m.Session.Filter.ExcludedGuilds) == 0 {
 			m.Notice = "Choose a server first"
 			return nil
 		}
@@ -923,7 +927,9 @@ func (m *Model) action(id string) tea.Cmd {
 		m.FilterDialog = false
 		m.Focus = m.defaultFocus()
 	case "servers-clear":
-		*m.targetGuilds() = nil
+		included, excluded := m.targetGuilds()
+		*included = nil
+		*excluded = nil
 		if m.ServerTarget == "stats" {
 			return m.statsChanged()
 		}
@@ -975,13 +981,25 @@ func (m *Model) action(id string) tea.Cmd {
 		m.MarginDialog = false
 		m.Focus = m.defaultFocus()
 	case "days-apply":
-		dates, err := session.Dates(m.DayInput.Value(), m.Session.Today)
+		dates, seconds, err := session.Dates(m.DayInput.Value(), m.Session.Today)
 		if err != nil {
 			m.Notice = err.Error()
 			return nil
 		}
-		m.Session.Filter.Dates = slices.Compact(slices.Sorted(slices.Values(append(m.Session.Filter.Dates, dates...))))
-		m.Session.Filter.IncidentSeconds = nil
+		if len(seconds) > 0 {
+			m.Session.Filter.Dates = nil
+			m.Session.Filter.DateBefore = 0
+			m.Session.Filter.DateAfter = 0
+			merged := maps.Clone(m.Session.Filter.IncidentSeconds)
+			if merged == nil {
+				merged = map[int64]int64{}
+			}
+			maps.Copy(merged, seconds)
+			m.Session.Filter.IncidentSeconds = merged
+		} else {
+			m.Session.Filter.Dates = slices.Compact(slices.Sorted(slices.Values(append(m.Session.Filter.Dates, dates...))))
+			m.Session.Filter.IncidentSeconds = nil
+		}
 		m.DayInput.SetValue("")
 		m.Session.Filter.From = ""
 		m.Session.Filter.Until = ""

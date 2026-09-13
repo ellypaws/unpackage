@@ -17,14 +17,26 @@ func (m *Model) enabled(id string) bool {
 	f := m.Session.Filter
 	switch id {
 	case "days-apply":
-		dates, err := session.Dates(m.DayInput.Value(), m.Session.Today)
-		return err == nil && (len(f.IncidentSeconds) > 0 || f.From != "" || f.Until != "" || slices.ContainsFunc(dates, func(day string) bool { return !slices.Contains(f.Dates, day) }))
+		dates, seconds, err := session.Dates(m.DayInput.Value(), m.Session.Today)
+		if err != nil {
+			return false
+		}
+		if len(seconds) > 0 {
+			added := false
+			for second := range seconds {
+				if _, ok := f.IncidentSeconds[second]; !ok {
+					added = true
+				}
+			}
+			return added || len(f.Dates) > 0 || f.From != "" || f.Until != "" || f.DateBefore != 0 || f.DateAfter != 0
+		}
+		return len(f.IncidentSeconds) > 0 || f.From != "" || f.Until != "" || slices.ContainsFunc(dates, func(day string) bool { return !slices.Contains(f.Dates, day) })
 	case "dates-clear":
 		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || f.From != "" || f.Until != ""
 	case "clipboard":
 		return m.IncidentProcessing == ""
 	case "clear":
-		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || f.Channel != "" || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
+		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || f.Channel != "" || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
 	case "previous":
 		return m.Offset > 0 && !m.Loading
 	case "next":
@@ -34,7 +46,8 @@ func (m *Model) enabled(id string) bool {
 	case "servers-next":
 		return m.ServerOffset+m.serverPageSize() < len(m.filteredServers())
 	case "servers-clear":
-		return len(*m.targetGuilds()) > 0
+		included, excluded := m.targetGuilds()
+		return len(*included) > 0 || len(*excluded) > 0
 	case "stats-prev":
 		return m.StatsOffset > 0
 	case "stats-next":
@@ -46,9 +59,9 @@ func (m *Model) enabled(id string) bool {
 	case "command-run":
 		return strings.TrimSpace(m.Input.Value()) != ""
 	case "request-save":
-		return strings.TrimSpace(m.RequestInput.Value()) != "" && len(f.Guilds) > 0 && (m.RequestScope != "filtered" || m.resultCount() > 0)
+		return strings.TrimSpace(m.RequestInput.Value()) != "" && (len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0) && (m.RequestScope != "filtered" || m.resultCount() > 0)
 	case "draft":
-		return len(f.Guilds) > 0
+		return len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0
 	case "margin-apply":
 		if len(f.IncidentSeconds) > 0 {
 			return false

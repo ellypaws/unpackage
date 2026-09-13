@@ -62,7 +62,7 @@ func optionLabel(options []option, key string) string {
 }
 
 func (m *Model) statsFilter() store.StatsFilter {
-	f := store.StatsFilter{Guilds: slices.Clone(m.StatsGuilds)}
+	f := store.StatsFilter{Guilds: slices.Clone(m.StatsGuilds), ExcludedGuilds: slices.Clone(m.StatsExcludedGuilds)}
 	if days := session.RangeDays(m.StatsRange); days > 0 {
 		f.From, f.Until = session.RangeWindow(days, m.Session.Today)
 	}
@@ -189,6 +189,7 @@ func (m *Model) openLeader(l store.Leader, metric store.Metric) tea.Cmd {
 	switch l.Kind {
 	case "server":
 		m.StatsGuilds = []string{l.ID}
+		m.StatsExcludedGuilds = nil
 		m.StatsScope = scope{}
 		m.openEntity(store.EntityChannels, metric)
 		return m.statsChanged()
@@ -283,7 +284,7 @@ func (m *Model) statsAction(id string) (tea.Cmd, bool) {
 		if !ok {
 			return nil, true
 		}
-		m.Session.Filter = store.Filter{Mode: cmpMode(f.Mode), Limit: 50, Guilds: f.Guilds, Channel: f.Channel, Media: f.Media, Search: f.Search, From: f.From, Until: f.Until}
+		m.Session.Filter = store.Filter{Mode: cmpMode(f.Mode), Limit: 50, Guilds: f.Guilds, ExcludedGuilds: f.ExcludedGuilds, Channel: f.Channel, Media: f.Media, Search: f.Search, From: f.From, Until: f.Until}
 		m.SearchInput.SetValue(f.Search)
 		m.SearchRevision++
 		m.ChannelLabel = leaderName(m.StatsTarget)
@@ -502,13 +503,8 @@ func (m *Model) stats(w, h int) string {
 		active := m.StatsView == v.key || v.key == "leaders" && (m.StatsView == "entity" || m.StatsView == "messages")
 		tabs = append(tabs, m.button("stats-view-"+v.key, v.label, active))
 	}
-	serversLabel := "All servers"
-	if n := len(m.StatsGuilds); n == 1 {
-		serversLabel = "1 server"
-	} else if n > 1 {
-		serversLabel = fmt.Sprintf("%d servers", n)
-	}
-	header := strings.Join(tabs, " ") + "  " + m.dropdown("stats-range", optionLabel(statsRanges, m.StatsRange), m.StatsRange != "all") + " " + m.button("stats-servers", serversLabel, len(m.StatsGuilds) > 0)
+	serversLabel := serverSelectionLabel(m.StatsGuilds, m.StatsExcludedGuilds)
+	header := strings.Join(tabs, " ") + "  " + m.dropdown("stats-range", optionLabel(statsRanges, m.StatsRange), m.StatsRange != "all") + " " + m.button("stats-servers", serversLabel, len(m.StatsGuilds) > 0 || len(m.StatsExcludedGuilds) > 0)
 	if m.StatsScope.Kind != "" {
 		chip := m.button("stats-scope-clear", components.Fit(strings.ToUpper(m.StatsScope.Kind[:1])+m.StatsScope.Kind[1:]+": "+m.StatsScope.Label+" ×", w-2), true)
 		if lipgloss.Width(header)+lipgloss.Width(chip)+1 <= w {
@@ -1011,12 +1007,7 @@ func (m *Model) statsMessages(w, h int) string {
 		nameWidth := max(8, metaWidth-lipgloss.Width(date)-2)
 		name := metaStyle.Render(components.Fit(r.Server+" / "+displayChannel(r), nameWidth))
 		meta := name + strings.Repeat(" ", max(1, metaWidth-lipgloss.Width(name)-lipgloss.Width(date))) + date
-		preview := r.Content
-		if preview == "" && r.HasMedia {
-			preview = "Media attachment"
-		} else if preview == "" && r.HasAttachments {
-			preview = "Attachment"
-		}
+		preview := messagePreview(r)
 		content := contentStyle.Render(components.Fit(preview, cw-4))
 		m.HoverOnly = append(m.HoverOnly, id)
 		lines = append(lines, m.Zones.Mark(id, rowStyle.Render(meta+"\n"+content)))

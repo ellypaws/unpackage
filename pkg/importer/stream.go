@@ -89,7 +89,7 @@ func digits(v string) bool {
 	return true
 }
 
-var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true, "event_type": true, "event_id": true, "application_name": true, "application_id": true, "activity_duration_s": true, "total_duration_s": true, "duration": true, "duration_connected_ms": true, "os": true, "browser": true, "emoji_name": true, "context": true, "global_name": true, "channel": true}
+var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true, "event_type": true, "event_id": true, "application_name": true, "application_id": true, "activity_duration_s": true, "total_duration_s": true, "duration": true, "duration_connected_ms": true, "os": true, "browser": true, "emoji_name": true, "context": true, "global_name": true, "channel": true, "server": true, "message_id": true, "length": true, "word_count": true, "num_urls": true, "num_attachments": true, "attachment_content_types": true, "attachment_mimetypes": true}
 
 const attachmentURLsKey = "attachment_urls"
 
@@ -195,6 +195,8 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 				out["guild_name"] = child["name"]
 			} else if key == "recipients" {
 				out["recipients"] = child["items"]
+			} else if wanted[key] && child["items"] != "" {
+				out[key] = child["items"]
 			}
 		}
 		if _, e = d.Token(); e != nil {

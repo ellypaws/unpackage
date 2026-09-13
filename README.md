@@ -33,6 +33,12 @@ request.
 The app is offline. It does not sign in to Discord, upload your packages, send a request, or delete
 messages. A missing message is a candidate for review, not proof that Discord deleted it.
 
+If you only have one package, unpackage also reads `send_message` analytics records from
+`Activity/reporting` and `Activity/tns`. These records can preserve a message ID, channel, server,
+time, client, and counts after the message body is absent from `Messages`. They do not contain the
+message text. The app labels them `send event only`, merges duplicate evidence by message ID, and
+shows its source and reported metadata in the message details and structured exports.
+
 ## Download
 
 > [!TIP]
@@ -47,8 +53,8 @@ rows high for the full-screen interface.
 1. Download the Windows executable from the release page.
 2. Open a terminal in the folder where you saved it.
 3. Start `unpackage.exe`.
-4. Choose the older and newer Discord package folders or ZIP files.
-5. Review the missing-message list, then narrow it by date, server, search text, or attachments.
+4. Choose one Discord package, or choose older and newer package folders or ZIP files to compare.
+5. Review the available message evidence, then narrow it by date, server, search text, or attachments.
 
 The app keeps what it reads in memory for the current session. It does not change your source
 packages. Close the app to clear the loaded data.
@@ -72,12 +78,18 @@ their custom name with the participants in parentheses, or the participants' glo
 export includes them. The export does not list who was in a voice channel with you.
 
 The server picker sorts by message count. Use the sort control to switch to name or missing count.
+Activate a server once to include it, again to exclude it, and a third time to clear it. If any
+servers are included, only those servers are eligible. Excluded servers are always removed.
 
 Use `Paste from clipboard` in the Investigate tab after copying a Discord safety-notice message
 response. This avoids terminals that replay Ctrl+V input synchronously. Recognized responses add
 every `incident_time` to the exact-second message filter, so repeated pastes accumulate and
 duplicate times are ignored. Clipboard contents are processed in memory and are not shown in the
-command console or written to logs.
+command console or written to logs. On Linux the app tries `wl-paste`, `xclip`, `xsel`, and on WSL
+`powershell.exe`, in that order, so install `wl-clipboard`, `xclip`, or `xsel` if none are present.
+If the clipboard still cannot be read, type the unix seconds into the
+date box instead, for example `1700000000; 1700000060`. Whole numbers above 100000 are treated as
+unix times rather than days ago, and each entry is added to the exact-second filter.
 
 The package browser keeps parent folders visible in columns. Hover a narrow column to expand it.
 Type part of a folder name to filter and highlight fuzzy matches, then use `Tab` to complete the
@@ -113,6 +125,8 @@ open newer "C:\Exports\newer"
 status
 mode missing
 servers
+select 300000000000000001
+exclude 300000000000000002
 dates "2022-11-19; 1,396 days ago"
 search "some text"
 list jsonl
@@ -124,15 +138,16 @@ results. Use `clear` to reset filters and `stop` to stop an import while keeping
 
 ## Create a deletion-request draft
 
-Select one or more server IDs, then choose the scope of the draft:
+Include or exclude one or more server IDs, then choose the scope of the draft:
 
 ```text
 select 300000000000000001 300000000000000002
+exclude 300000000000000003
 request "deletion-request.txt" filtered
 ```
 
-`filtered` uses the current filters. `all` includes every observed message from the selected
-servers. The draft contains server, channel, and message IDs for review. It does not include
+`filtered` uses the current filters. `all` includes every observed message admitted by the server
+selection. The draft contains server, channel, and message IDs for review. It does not include
 message bodies or attachment URLs, and it is never sent automatically.
 
 ## Command-line comparison
@@ -143,8 +158,9 @@ For a script-friendly JSONL result:
 unpackage.exe diff "C:\Exports\older.zip" "C:\Exports\newer" > missing.jsonl
 ```
 
-Add `--format tsv` for tab-separated output. You can also use `--server ID`, `--date DATE`,
-`--search TEXT`, `--media all|attachments|media`, and `--mode missing|all|older|newer|present`.
+Add `--format tsv` for tab-separated output. You can also use `--server ID`,
+`--exclude-server ID`, `--date DATE`, `--search TEXT`, `--media all|attachments|media`, and
+`--mode missing|all|older|newer|present`.
 
 ## Keyboard shortcuts
 

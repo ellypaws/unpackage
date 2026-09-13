@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/signal"
+	"slices"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -95,12 +98,20 @@ func run() error {
 			scope = val
 		case "--server":
 			s.Filter.Guilds = append(s.Filter.Guilds, strings.Split(val, ",")...)
+		case "--exclude-server":
+			s.Filter.ExcludedGuilds = append(s.Filter.ExcludedGuilds, strings.Split(val, ",")...)
 		case "--date":
-			ds, e := session.Dates(val, s.Today)
+			ds, seconds, e := session.Dates(val, s.Today)
 			if e != nil {
 				return e
 			}
 			s.Filter.Dates = append(s.Filter.Dates, ds...)
+			if len(seconds) > 0 {
+				if s.Filter.IncidentSeconds == nil {
+					s.Filter.IncidentSeconds = map[int64]int64{}
+				}
+				maps.Copy(s.Filter.IncidentSeconds, seconds)
+			}
 		case "--search":
 			s.Filter.Search = val
 		case "--media":
@@ -125,6 +136,16 @@ func run() error {
 			s.Filter.Mode = val
 		default:
 			return fmt.Errorf("unknown option %s", key)
+		}
+	}
+	for _, id := range append(slices.Clone(s.Filter.Guilds), s.Filter.ExcludedGuilds...) {
+		if _, e := strconv.ParseUint(id, 10, 64); e != nil {
+			return fmt.Errorf("server filters require numeric IDs")
+		}
+	}
+	for _, id := range s.Filter.Guilds {
+		if slices.Contains(s.Filter.ExcludedGuilds, id) {
+			return fmt.Errorf("server %q cannot be both included and excluded", id)
 		}
 	}
 	if e = s.Open(ctx, 0, a[1]); e != nil {

@@ -119,7 +119,7 @@ type Model struct {
 	StatsPalette, StatsCells, StatsScale          string
 	StatsEntity                                   string
 	StatsMetric                                   store.Metric
-	StatsGuilds                                   []string
+	StatsGuilds, StatsExcludedGuilds              []string
 	StatsRevision, StatsShown                     int
 	StatsLoading                                  bool
 	StatsAt                                       time.Time
@@ -151,7 +151,7 @@ func New(ctx context.Context, s *session.Session) *Model {
 	input.CharLimit = 4096
 	days := textinput.New()
 	days.Prompt = ""
-	days.Placeholder = "Days ago or YYYY-MM-DD"
+	days.Placeholder = "Days ago, YYYY-MM-DD, or unix time"
 	days.CharLimit = 1024
 	days.PlaceholderStyle = lipgloss.NewStyle().Foreground(components.Muted)
 	search := textinput.New()
@@ -181,11 +181,11 @@ func New(ctx context.Context, s *session.Session) *Model {
 	return &Model{Session: s, ctx: ctx, Zones: zone.New(), Width: 90, Height: 28, Input: input, ServerInput: serverInput, DayInput: days, SearchInput: search, RequestInput: request, BeforeInput: before, AfterInput: after, PackagesExpanded: true, Viewport: viewport.New(80, 15), Focus: "open-old", RequestScope: "all", FollowLog: true, ConsoleFollow: true, ServerSort: "messages", ServerTarget: "filter", StatsView: "overview", StatsRange: "all", StatsLayout: "hours", StatsPalette: "violet", StatsCells: "blocks", StatsScale: "linear", StatsEntity: string(store.EntityServers), StatsRowCount: 8, Figures: map[string]figureState{}}
 }
 
-func (m *Model) targetGuilds() *[]string {
+func (m *Model) targetGuilds() (included, excluded *[]string) {
 	if m.ServerTarget == "stats" {
-		return &m.StatsGuilds
+		return &m.StatsGuilds, &m.StatsExcludedGuilds
 	}
-	return &m.Session.Filter.Guilds
+	return &m.Session.Filter.Guilds, &m.Session.Filter.ExcludedGuilds
 }
 
 func (m *Model) sortServers() {
@@ -214,6 +214,7 @@ func (m *Model) refresh() tea.Cmd {
 	m.Loading = true
 	f := m.Session.Filter
 	f.Guilds = slices.Clone(f.Guilds)
+	f.ExcludedGuilds = slices.Clone(f.ExcludedGuilds)
 	f.Dates = slices.Clone(f.Dates)
 	f.IncidentSeconds = maps.Clone(f.IncidentSeconds)
 	f.Limit = m.pageSize()

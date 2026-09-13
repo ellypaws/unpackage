@@ -170,31 +170,51 @@ func Split(line string) ([]string, error) {
 	}
 	return out, nil
 }
-func Dates(text string, today time.Time) ([]string, error) {
-	var out []string
+
+const maxDaysAgo = 100000
+
+// Dates parses date box input into calendar days or exact unix seconds.
+// Whole numbers above maxDaysAgo are unix seconds; a fraction is dropped.
+// Seconds map to message id 0 because typed times have no source message.
+func Dates(text string, today time.Time) ([]string, map[int64]int64, error) {
+	var dates []string
+	var seconds map[int64]int64
 	for group := range strings.SplitSeq(text, ";") {
 		entries := []string{group}
-		if _, err := dateEntry(group, today); err != nil && strings.Contains(group, ",") {
+		if _, _, err := dateEntry(group, today); err != nil && strings.Contains(group, ",") {
 			entries = strings.Split(group, ",")
 		}
 		for _, entry := range entries {
-			date, err := dateEntry(entry, today)
+			date, second, err := dateEntry(entry, today)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			out = append(out, date)
+			if second > 0 {
+				if seconds == nil {
+					seconds = map[int64]int64{}
+				}
+				seconds[second] = 0
+				continue
+			}
+			dates = append(dates, date)
 		}
 	}
-	return out, nil
+	if len(dates) > 0 && len(seconds) > 0 {
+		return nil, nil, fmt.Errorf("use dates or unix times, not both")
+	}
+	return dates, seconds, nil
 }
 
-func dateEntry(text string, today time.Time) (string, error) {
+func dateEntry(text string, today time.Time) (string, int64, error) {
 	text = strings.TrimSpace(text)
 	if _, err := time.Parse(time.DateOnly, text); err == nil {
-		return text, nil
+		return text, 0, nil
 	}
 	if strings.Contains(text, "-") {
-		return "", fmt.Errorf("invalid date; use YYYY-MM-DD")
+		return "", 0, fmt.Errorf("invalid date; use YYYY-MM-DD")
+	}
+	if second, ok := unixEntry(text); ok {
+		return "", second, nil
 	}
 
 	value := strings.ToLower(text)
@@ -205,31 +225,43 @@ func dateEntry(text string, today time.Time) (string, error) {
 		value = strings.TrimSpace(withoutDay)
 	}
 	if value == "" {
-		return "", fmt.Errorf("enter a date or days ago")
+		return "", 0, fmt.Errorf("enter a date, days ago, or unix time")
 	}
 	groups := strings.Split(value, ",")
 	if len(groups) > 1 {
 		if len(groups[0]) < 1 || len(groups[0]) > 3 {
-			return "", fmt.Errorf("enter a date or days ago")
+			return "", 0, fmt.Errorf("enter a date, days ago, or unix time")
 		}
 		for _, group := range groups {
 			if group != strings.TrimSpace(group) || strings.Trim(group, "0123456789") != "" {
-				return "", fmt.Errorf("enter a date or days ago")
+				return "", 0, fmt.Errorf("enter a date, days ago, or unix time")
 			}
 		}
 		for _, group := range groups[1:] {
 			if len(group) != 3 {
-				return "", fmt.Errorf("enter a date or days ago")
+				return "", 0, fmt.Errorf("enter a date, days ago, or unix time")
 			}
 		}
 	}
 	value = strings.ReplaceAll(value, ",", "")
 	if strings.Trim(value, "0123456789") != "" {
-		return "", fmt.Errorf("enter a date or days ago")
+		return "", 0, fmt.Errorf("enter a date, days ago, or unix time")
 	}
 	n, err := strconv.Atoi(value)
-	if err != nil || n > 100000 {
-		return "", fmt.Errorf("days must be between 0 and 100000")
+	if err != nil || n > maxDaysAgo {
+		return "", 0, fmt.Errorf("days must be between 0 and %d", maxDaysAgo)
 	}
-	return today.AddDate(0, 0, -n).Format(time.DateOnly), nil
+	return today.AddDate(0, 0, -n).Format(time.DateOnly), 0, nil
+}
+
+func unixEntry(text string) (int64, bool) {
+	whole, fraction, _ := strings.Cut(text, ".")
+	if whole == "" || strings.Trim(whole, "0123456789") != "" || strings.Trim(fraction, "0123456789") != "" {
+		return 0, false
+	}
+	second, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil || second <= maxDaysAgo {
+		return 0, false
+	}
+	return second, true
 }
