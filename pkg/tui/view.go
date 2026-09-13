@@ -583,7 +583,7 @@ func (m *Model) results(w, h int) string {
 	}
 	total := m.resultCount()
 	label := "messages"
-	if len(m.Rows) > 0 && m.Rows[0].Status == "missing" {
+	if len(m.Rows) > 0 && m.Rows[0].Status == "missing" && (m.Session.Filter.Mode == "missing" || len(m.Session.Filter.IncidentSeconds) == 0) {
 		label = "missing messages"
 	}
 	if total == 1 {

@@ -663,9 +663,10 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	labels := serverLabels(s.effectiveChannelsLocked(same))
 	lookup := s.nameLookupLocked()
 	mode := f.Mode
+	incidentAuto := (mode == "" || mode == "auto") && len(incidentSeconds) > 0 && ok
 	if mode == "" || mode == "auto" {
 		mode = "all"
-		if ok {
+		if ok && !incidentAuto {
 			mode = "missing"
 		}
 	}
@@ -687,6 +688,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		c             channel
 		name          string
 		messageRecord bool
+		foundInNew    bool
 		missing       bool
 	}
 	var items []item
@@ -732,8 +734,10 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			}
 			m := observed.Message
 			if len(incidentSeconds) > 0 {
-				created, err := time.Parse(time.RFC3339Nano, m.Date)
-				if err != nil || !incidentSeconds[created.Unix()] {
+				created, _ := time.Parse(time.RFC3339Nano, m.Date)
+				messageMatch := !created.IsZero() && incidentSeconds[created.Unix()]
+				eventMatch := !observed.Sent.Time.IsZero() && incidentSeconds[observed.Sent.Time.Unix()]
+				if !messageMatch && !eventMatch {
 					continue
 				}
 			}
@@ -761,7 +765,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				name = channelLabel(c, m.Channel, lookup)
 				labelled[m.Channel] = name
 			}
-			items = append(items, item{m: m, sent: sent, c: c, name: name, messageRecord: observed.MessageRecord, missing: same && slot == 0 && !inNewRecord})
+			items = append(items, item{m: m, sent: sent, c: c, name: name, messageRecord: observed.MessageRecord, foundInNew: inNewRecord, missing: same && slot == 0 && !inNewRecord})
 		}
 	}
 	s.mu.RUnlock()
@@ -802,6 +806,8 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		status := "observed"
 		if v.missing {
 			status = "missing"
+		} else if incidentAuto && v.foundInNew {
+			status = "found in newer"
 		} else if mode == "present" || mode == "new" {
 			status = mode
 		} else if !v.messageRecord {
