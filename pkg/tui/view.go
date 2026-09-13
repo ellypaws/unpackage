@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"cmp"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -64,7 +65,7 @@ func (m *Model) modal(title, body string) string {
 	}
 	width := min(m.Width-2, max(lipgloss.Width(body)+6, lipgloss.Width(title)+7))
 	panel := components.TitledBox(title, body, width, 2, lipgloss.RoundedBorder(), border, m.Frame, m.workLabel() != "")
-	return m.Zones.Scan(lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, panel))
+	return m.Zones.Scan(m.overlayMenu(lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, panel)))
 }
 
 func (m *Model) workLabel() string {
@@ -85,6 +86,9 @@ func (m *Model) workLabel() string {
 	}
 	if m.Session.Busy() {
 		return "Importing packages…"
+	}
+	if m.Tab == tabStats && m.StatsLoading {
+		return "Computing statistics…"
 	}
 	if m.Executing {
 		switch m.LastCommand {
@@ -133,6 +137,8 @@ func (m *Model) appTitle(width int) string {
 func (m *Model) View() string {
 	m.Actions = nil
 	m.HoverOnly = nil
+	m.Tips = map[string]string{}
+	defer m.previewMenu()()
 	w := max(16, m.Width-4)
 	h := m.bodyHeight()
 	if m.Width < 64 || m.Height < 24 {
@@ -163,7 +169,11 @@ func (m *Model) View() string {
 		return m.modal("Around each selected date", body)
 	}
 	if m.ServerDialog {
-		return m.modal("Servers", m.servers())
+		title := "Servers"
+		if m.ServerTarget == "stats" {
+			title = "Statistics servers"
+		}
+		return m.modal(title, m.servers())
 	}
 	if m.FilterDialog {
 		body := m.filters(34)
@@ -189,7 +199,7 @@ func (m *Model) View() string {
 		return m.modal("Deletion request", body)
 	}
 	var tabs []string
-	for i, name := range []string{"Investigate", "Console", "Log"} {
+	for i, name := range []string{"Investigate", "Stats", "Console", "Log"} {
 		id := fmt.Sprintf("tab-%d", i)
 		m.Actions = append(m.Actions, id)
 		tabs = append(tabs, components.Tab(m.Zones, id, name, m.Hover, m.Focus, m.Tab == i, 2))
@@ -235,6 +245,8 @@ func (m *Model) View() string {
 		switch m.Tab {
 		case tabInvestigate:
 			body = m.investigate(w, h)
+		case tabStats:
+			body = m.stats(w, h)
 		case tabConsole:
 			body = m.console(w, h)
 		case tabLog:
@@ -264,7 +276,31 @@ func (m *Model) View() string {
 	if m.Tab == tabConsole {
 		footer = m.field("command", &m.Input, w) + "\n" + footer
 	}
-	return m.Zones.Scan(lipgloss.NewStyle().Padding(1, 2).Render(m.appTitle(w) + "\n" + tabRow + "\n\n" + lipgloss.NewStyle().Height(h).MaxHeight(h).Width(w).Render(body) + "\n" + footer))
+	frame := m.Zones.Scan(m.overlayMenu(lipgloss.NewStyle().Padding(1, 2).Render(m.appTitle(w) + "\n" + tabRow + "\n\n" + lipgloss.NewStyle().Height(h).MaxHeight(h).Width(w).Render(body) + "\n" + footer)))
+	if m.Menu != nil {
+		return frame
+	}
+	return m.withTooltip(frame)
+}
+
+// withTooltip paints the hovered element's description over the frame without moving anything underneath.
+func (m *Model) withTooltip(frame string) string {
+	text := m.Tips[m.Hover]
+	if text == "" {
+		return frame
+	}
+	zone := m.Zones.Get(m.Hover)
+	if zone == nil || zone.IsZero() {
+		return frame
+	}
+	box := components.Tooltip(components.Fit(text, max(10, m.Width-6)))
+	width, height := lipgloss.Width(box), lipgloss.Height(box)
+	x := min(max(0, zone.EndX+1-width), max(0, m.Width-width))
+	y := zone.StartY - height
+	if y < 0 {
+		y = zone.EndY + 1
+	}
+	return components.Overlay(frame, box, x, y)
 }
 func (m *Model) packageBox(slot, width int) string {
 	id := []string{"open-old", "open-new"}[slot]
@@ -488,8 +524,8 @@ func (m *Model) filters(w int) string {
 		margin = fmt.Sprintf("Date margin: %d before, %d after", f.DateBefore, f.DateAfter)
 	}
 	parts = append(parts, m.button("margin", components.Fit(margin, w-3), f.DateBefore > 0 || f.DateAfter > 0))
-	media := map[string]string{"": "All messages", "attachments": "Messages with attachments", "media": "Images, video or audio"}[f.Media]
-	parts = append(parts, m.button("media", components.Fit(media, w-3), f.Media != ""))
+	media := optionLabel(mediaOptions, f.Media)
+	parts = append(parts, m.dropdown("media", components.Fit(media, w-5), f.Media != ""))
 	servers := "All servers"
 	if len(f.Guilds) > 0 {
 		servers = fmt.Sprintf("%d servers selected", len(f.Guilds))
@@ -498,6 +534,9 @@ func (m *Model) filters(w int) string {
 		}
 	}
 	parts = append(parts, m.button("servers", servers, len(f.Guilds) > 0)+" "+m.button("clear", "Reset", false))
+	if f.Channel != "" {
+		parts = append(parts, m.button("channel-clear", components.Fit("Channel: "+cmp.Or(m.ChannelLabel, f.Channel)+" ×", w-3), true))
+	}
 	return strings.Join(parts, "\n")
 }
 func (m *Model) filterPanel(w, h int) string {
@@ -537,12 +576,11 @@ func (m *Model) results(w, h int) string {
 	if total == 1 {
 		label = strings.TrimSuffix(label, "s")
 	}
-	modes := map[string]string{"auto": "Auto", "missing": "Missing", "all": "All", "older": "Older", "newer": "Newer", "present": "In both", "new": "New"}
 	resultTitle := components.Title.Render(number(total) + " " + label)
 	if m.Loading {
 		resultTitle = components.Shimmer(number(total)+" "+label, m.Frame)
 	}
-	header := resultTitle + "  " + m.button("mode", modes[m.Session.Filter.Mode], false) + " " + m.button("previous", "‹", false) + " " + m.button("next", "›", false)
+	header := resultTitle + "  " + m.dropdown("mode", optionLabel(modeOptions, m.Session.Filter.Mode), false) + " " + m.button("previous", "‹", false) + " " + m.button("next", "›", false)
 	if m.PackagesExpanded {
 		header += " " + m.button("packages", "Hide packages", false)
 	}
@@ -704,15 +742,19 @@ func (m *Model) scrollbar(total, visible, height int) string {
 	m.ScrollHeight = height
 	m.ScrollTotal = total
 	m.ScrollVisible = visible
+	return m.scrollbarView("scrollbar", m.Offset, total, visible, height)
+}
+
+func (m *Model) scrollbarView(prefix string, offset, total, visible, height int) string {
 	thumbHeight := max(1, height*visible/max(1, total))
 	travel := max(0, height-thumbHeight)
 	thumbStart := 0
 	if total > visible {
-		thumbStart = travel * min(m.Offset, total-visible) / (total - visible)
+		thumbStart = travel * min(offset, total-visible) / (total - visible)
 	}
 	lines := make([]string, height)
 	for line := range height {
-		id := fmt.Sprintf("scrollbar-%d", line)
+		id := fmt.Sprintf("%s-%d", prefix, line)
 		m.Actions = append(m.Actions, id)
 		glyph := "│"
 		position := float64(line) / float64(max(1, height-1))
@@ -745,9 +787,10 @@ func (m *Model) servers() string {
 	w := min(m.Width-10, 120)
 	groups := m.filteredServers()
 	m.ServerOffset = min(m.ServerOffset, max(0, ((len(groups)-1)/m.serverPageSize())*m.serverPageSize()))
+	selected := *m.targetGuilds()
 	top := m.field("servers-input", &m.ServerInput, min(w, 38)) + "\n"
-	top += m.button("servers-close", "Done", true) + " " + m.button("servers-clear", "Clear selection", false) + " " + m.button("servers-prev", "‹", false) + " " + m.button("servers-next", "›", false)
-	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(fmt.Sprintf("%d matches, %d selected", len(groups), len(m.Session.Filter.Guilds))) + "\n"
+	top += m.button("servers-close", "Done", true) + " " + m.button("servers-clear", "Clear selection", false) + " " + m.dropdown("servers-sort", optionLabel(serverSorts, m.ServerSort), m.ServerSort != "messages") + " " + m.button("servers-prev", "‹", false) + " " + m.button("servers-next", "›", false)
+	top += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(fmt.Sprintf("%d matches, %d selected", len(groups), len(selected))) + "\n"
 	if m.ServerInput.Value() != m.ServerSearch {
 		top += components.Working("Searching servers…", m.Frame, w) + "\n"
 	}
@@ -770,14 +813,14 @@ func (m *Model) servers() string {
 		g := groups[i]
 		id := "server-" + g.ID
 		m.Actions = append(m.Actions, id)
-		selected := slices.Contains(m.Session.Filter.Guilds, g.ID)
+		chosen := slices.Contains(selected, g.ID)
 		mark := "[ ] "
-		if selected {
+		if chosen {
 			mark = "[x] "
 		}
 		style := lipgloss.NewStyle().Foreground(components.Text)
 		boxStyle := lipgloss.NewStyle().Width(cellWidth-2).Padding(0, 1)
-		if selected {
+		if chosen {
 			boxStyle = boxStyle.Background(components.Surface)
 			style = style.Foreground(components.Accent).Bold(true)
 		}
@@ -790,7 +833,11 @@ func (m *Model) servers() string {
 		if g.Count == 1 {
 			label = "message"
 		}
-		content := style.Render(mark) + name + "\n    " + components.Rule(float64(g.Count)/float64(peak), 7) + " " + lipgloss.NewStyle().Foreground(components.Muted).Render(number(g.Count)+" "+label)
+		summary := number(g.Count) + " " + label
+		if g.Missing > 0 {
+			summary += ", " + number(g.Missing) + " missing"
+		}
+		content := style.Render(mark) + name + "\n    " + components.Rule(float64(g.Count)/float64(peak), 7) + " " + lipgloss.NewStyle().Foreground(components.Muted).Render(components.Fit(summary, cellWidth-14))
 		col := (i - m.ServerOffset) % columns
 		lines[col] = append(lines[col], m.Zones.Mark(id, boxStyle.Render(content)))
 	}

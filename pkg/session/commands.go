@@ -36,13 +36,18 @@ last N                     Last N days, including today
 before YYYY-MM-DD          Before creation date
 search "text"              Search message contents
 channel ID                 Filter one channel
-kind guild|dm|unknown-dm|unknown|conflict|all
+kind guild|dm|group|unknown-dm|unknown|conflict|all
 media all|attachments|media
 clear                      Reset filters
 list [jsonl|tsv]            Stream all matching rows
 show MESSAGE_ID            Full message details
 stats                      Counts by server
 days                       Counts by creation date
+summary [DAYS|all]         Totals for the last DAYS days, default all
+leaders ENTITY [METRIC] [DAYS|all]
+                           ENTITY servers|channels|people|games|platforms|emoji
+                           METRIC messages|missing|media|voice|voice-time|play-time|sessions|reactions|streams
+heatmap [METRIC] [DAYS|all]  Weekday by hour grid
 request "draft.txt" all|filtered
 help                       Command reference
 quit                       Exit
@@ -57,6 +62,7 @@ package repl
 package sample DIRECTORY [MESSAGE_COUNT]
 
 Dates use local time. Quote paths with spaces.
+Statistics commands use the selected servers and combine both packages.
 Use Read from clipboard in Investigate to filter exact incident seconds.
 Request requires selected server IDs; all ignores other filters.
 Missing means absent from the newer export, not proof of deletion.`
@@ -213,7 +219,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		s.Filter.Channel = arg
 		s.Filter.Offset = 0
 	case "kind":
-		if !slices.Contains([]string{"guild", "dm", "unknown-dm", "unknown", "conflict", "all"}, arg) {
+		if !slices.Contains([]string{"guild", "dm", "group", "unknown-dm", "unknown", "conflict", "all"}, arg) {
 			return fmt.Errorf("unknown channel kind")
 		}
 		s.Filter.Kind = arg
@@ -268,6 +274,8 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		for _, g := range gs {
 			fmt.Fprintf(w, "%s\t%s\t%d\n", g.ID, Safe(g.Name), g.Count)
 		}
+	case "summary", "leaders", "heatmap":
+		return s.Statistics(ctx, a, w)
 	case "request":
 		if e := need(3); e != nil {
 			return e

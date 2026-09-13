@@ -89,7 +89,7 @@ func digits(v string) bool {
 	return true
 }
 
-var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true}
+var wanted = map[string]bool{"id": true, "channel_id": true, "channel_name": true, "guild_id": true, "guild_name": true, "name": true, "type": true, "content": true, "contents": true, "timestamp": true, "guild": true, "attachments": true, "content_type": true, "filename": true, "url": true, "event_type": true, "event_id": true, "application_name": true, "application_id": true, "activity_duration_s": true, "total_duration_s": true, "duration": true, "duration_connected_ms": true, "os": true, "browser": true, "emoji_name": true, "context": true, "global_name": true, "channel": true}
 
 const attachmentURLsKey = "attachment_urls"
 
@@ -193,6 +193,8 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 			} else if key == "guild" {
 				out["guild_id"] = child["id"]
 				out["guild_name"] = child["name"]
+			} else if key == "recipients" {
+				out["recipients"] = child["items"]
 			}
 		}
 		if _, e = d.Token(); e != nil {
@@ -208,12 +210,20 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 		}
 	case '[':
 		nonempty := false
+		items := 0
 		for d.More() {
 			nonempty = true
 			child, childErr := walk(d, depth+1, object, field)
 			if childErr != nil {
 				e = childErr
 				return nil, e
+			}
+			if value, ok := child["$"]; ok && value != "" && items < 128 && len(value) <= 256 {
+				if items > 0 {
+					out["items"] += "\n"
+				}
+				out["items"] += value
+				items++
 			}
 			if value, ok := child["$"]; ok && attachmentPresent(value) {
 				out["has_attachments"] = "1"

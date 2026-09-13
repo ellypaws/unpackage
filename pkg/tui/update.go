@@ -105,10 +105,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, s := range m.Snapshots {
 			pending = pending || s.State == "loading"
 		}
+		cmds := []tea.Cmd{tick(active)}
 		if pending {
-			return m, tea.Batch(tick(active), m.refresh())
+			cmds = append(cmds, m.refresh())
 		}
-		return m, tick(active)
+		if m.Tab == tabStats && m.statsStale() && time.Since(m.StatsAt) > time.Second {
+			cmds = append(cmds, m.refreshStats())
+		}
+		return m, tea.Batch(cmds...)
 	case dataMsg:
 		m.Loading = false
 		if v.Revision != m.Revision {
@@ -120,6 +124,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Servers = mergeServerOrder(m.Servers, v.Servers)
 		} else {
 			m.Servers = v.Servers
+			m.sortServers()
 		}
 		m.Days = v.Days
 		m.Snapshots = v.Snapshots
@@ -128,6 +133,37 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Notice = v.Err.Error()
 		}
 		m.Cursor = min(m.Cursor, max(0, len(m.Rows)-1))
+		if key := snapshotKey(v.Snapshots); key != m.SnapshotKey {
+			m.SnapshotKey = key
+			m.StatsRevision++
+			if m.Tab == tabStats && time.Since(m.StatsAt) > time.Second {
+				return m, m.refreshStats()
+			}
+		}
+		return m, nil
+	case statsRowsMsg:
+		if v.Revision != m.StatsRowsRevision {
+			return m, nil
+		}
+		m.StatsRowsLoading = false
+		if v.Err != nil {
+			m.Notice = v.Err.Error()
+			return m, nil
+		}
+		m.StatsRows = v.Rows
+		return m, nil
+	case statsMsg:
+		m.StatsLoading = false
+		if v.Revision != m.StatsRevision {
+			return m, m.refreshStats()
+		}
+		m.StatsAt = time.Now()
+		if v.Err != nil {
+			m.Notice = v.Err.Error()
+			return m, nil
+		}
+		m.Stats = v.Stats
+		m.StatsShown = v.Revision
 		return m, nil
 	case resultMsg:
 		m.Executing = false
@@ -137,6 +173,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.LastCommand == "clear" {
 			m.DayInput.SetValue("")
+			m.ChannelLabel = ""
 		}
 		m.ConsoleFollow = m.LastCommand != "help"
 		if !m.ConsoleFollow {
@@ -188,6 +225,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.run(fmt.Sprintf("open %s \"%s\"", []string{"older", "newer"}[m.PickSlot], v.Path))
 	case tea.BlurMsg:
 		m.Hover = ""
+		m.Menu = nil
 		return m, nil
 	case tea.MouseMsg:
 		if m.Picker != nil {
@@ -209,6 +247,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.Hover = ""
+		if m.Menu != nil {
+			// An open menu sits above everything, so only its items, its frame, and its anchor can take the pointer.
+			for _, id := range m.Actions {
+				if strings.HasPrefix(id, "menu") && m.Zones.Get(id).InBounds(v) {
+					m.Hover = id
+					break
+				}
+			}
+			if m.Hover == "" && m.Zones.Get(m.Menu.ID).InBounds(v) {
+				m.Hover = m.Menu.ID
+			}
+			if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft {
+				return m, m.menuClick()
+			}
+			return m, nil
+		}
 		for _, id := range m.HoverOnly {
 			if m.Zones.Get(id).InBounds(v) {
 				m.Hover = id
@@ -248,15 +302,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Offset = max(0, min(max(0, m.ScrollTotal-m.ScrollVisible), m.Offset+delta*3))
 				return m, m.refresh()
 			}
+			if m.Tab == tabStats && !m.ServerDialog {
+				m.statsScroll(delta)
+				return m, nil
+			}
 			if m.ServerDialog {
 				m.ServerOffset = max(0, min(max(0, len(m.filteredServers())-m.serverPageSize()), m.ServerOffset+delta*m.serverColumns()))
 				return m, nil
 			}
 		}
-		if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft && slices.Contains(m.Actions, m.Hover) {
-			m.Focus = m.Hover
-			m.focusInput()
-			return m, m.action(m.Hover)
+		if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft {
+			if r, c, ok := heatCell(m.Hover); ok {
+				m.HeatCursor = [2]int{r, c}
+				m.Focus = "heat"
+				m.focusInput()
+				return m, nil
+			}
+			if strings.HasPrefix(m.Hover, "stats-row-") || strings.HasPrefix(m.Hover, "crow-") || strings.HasPrefix(m.Hover, "srow-") {
+				return m, m.action(m.Hover)
+			}
+			if slices.Contains(m.Actions, m.Hover) {
+				m.Focus = m.Hover
+				m.focusInput()
+				return m, m.action(m.Hover)
+			}
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -318,6 +387,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.Session.Stop()
 			return m, tea.Quit
+		}
+		if m.Menu != nil {
+			return m, m.menuKey(key)
 		}
 		if key == "esc" {
 			if m.Picker != nil {
@@ -433,7 +505,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.run("help")
 		}
 		if key == "ctrl+tab" {
-			m.Tab = (m.Tab + 1) % 3
+			m.Tab = (m.Tab + 1) % tabCount
 			m.Detail = nil
 			if m.Tab == tabConsole {
 				m.Focus = "command"
@@ -441,6 +513,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.Focus = m.defaultFocus()
 				m.Input.Blur()
+			}
+			if m.Tab == tabStats {
+				return m, m.ensureStats()
 			}
 			return m, nil
 		}
@@ -491,6 +566,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		if m.Focus != "command" {
+			if m.Tab == tabStats && !m.ServerDialog && m.statsKey(key) {
+				return m, nil
+			}
 			if m.ServerDialog && slices.Contains([]string{"up", "down", "left", "right"}, key) {
 				groups := m.filteredServers()
 				if len(groups) == 0 {
@@ -662,15 +740,22 @@ func (m *Model) action(id string) tea.Cmd {
 		return m.refresh()
 	}
 	if g, ok := strings.CutPrefix(id, "server-"); ok {
-		ids := m.Session.Filter.Guilds
+		target := m.targetGuilds()
+		ids := *target
 		i := slices.Index(ids, g)
 		if i >= 0 {
 			ids = slices.Delete(ids, i, i+1)
 		} else {
 			ids = append(ids, g)
 		}
-		m.Session.Filter.Guilds = ids
+		*target = ids
+		if m.ServerTarget == "stats" {
+			return m.statsChanged()
+		}
 		return m.changed()
+	}
+	if cmd, ok := m.statsAction(id); ok {
+		return cmd
 	}
 	var n int
 	if _, e := fmt.Sscanf(id, "row-server-%d", &n); e == nil && n >= 0 && n < len(m.Rows) {
@@ -697,6 +782,9 @@ func (m *Model) action(id string) tea.Cmd {
 			m.Input.Blur()
 		}
 		m.Viewport.GotoTop()
+		if n == tabStats {
+			return m.ensureStats()
+		}
 		return nil
 	}
 	switch id {
@@ -755,16 +843,6 @@ func (m *Model) action(id string) tea.Cmd {
 		m.SearchInput.SetValue("")
 		m.SearchRevision++
 		return m.run("clear")
-	case "mode":
-		modes := []string{"auto", "missing", "all", "older", "newer", "present", "new"}
-		i := slices.Index(modes, m.Session.Filter.Mode)
-		m.Session.Filter.Mode = modes[(i+1)%len(modes)]
-		return m.changed()
-	case "media":
-		media := []string{"", "attachments", "media"}
-		i := slices.Index(media, m.Session.Filter.Media)
-		m.Session.Filter.Media = media[(i+1)%len(media)]
-		return m.changed()
 	case "previous":
 		m.Offset = max(0, m.Offset-m.pageSize())
 		return m.refresh()
@@ -811,12 +889,16 @@ func (m *Model) action(id string) tea.Cmd {
 		m.Revision++
 		return func() tea.Msg { return resultMsg{Err: m.Session.Clear(m.ctx, slot)} }
 	case "servers":
+		m.ServerTarget = "filter"
 		m.ServerDialog = true
+		m.sortServers()
 		m.Focus = "servers-input"
 		m.focusInput()
 	case "servers-close":
 		m.ServerDialog = false
 		m.Focus = m.defaultFocus()
+	case "servers-sort":
+		m.openMenu(id)
 	case "servers-search":
 		m.ServerRevision++
 		m.ServerSearch = m.ServerInput.Value()
@@ -831,7 +913,14 @@ func (m *Model) action(id string) tea.Cmd {
 		m.FilterDialog = false
 		m.Focus = m.defaultFocus()
 	case "servers-clear":
-		m.Session.Filter.Guilds = nil
+		*m.targetGuilds() = nil
+		if m.ServerTarget == "stats" {
+			return m.statsChanged()
+		}
+		return m.changed()
+	case "channel-clear":
+		m.Session.Filter.Channel = ""
+		m.ChannelLabel = ""
 		return m.changed()
 	case "days-input", "search-input", "request-path", "margin-before", "margin-after", "servers-input":
 		m.Focus = id
@@ -1022,7 +1111,17 @@ func (m *Model) defaultFocus() string {
 		return "command"
 	case tabLog:
 		return "log-follow"
+	case tabStats:
+		return "stats-view-" + m.StatsView
 	default:
 		return "days-input"
 	}
+}
+
+func snapshotKey(snapshots []store.Snapshot) string {
+	var b strings.Builder
+	for _, s := range snapshots {
+		fmt.Fprintf(&b, "%d:%s:%s:%s:%d:%d:%t;", s.Slot, s.Owner, s.State, s.Phase, s.Count, s.Bytes, s.Complete)
+	}
+	return b.String()
 }

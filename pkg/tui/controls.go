@@ -24,7 +24,7 @@ func (m *Model) enabled(id string) bool {
 	case "clipboard":
 		return m.IncidentProcessing == ""
 	case "clear":
-		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
+		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || f.Channel != "" || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
 	case "previous":
 		return m.Offset > 0 && !m.Loading
 	case "next":
@@ -34,7 +34,11 @@ func (m *Model) enabled(id string) bool {
 	case "servers-next":
 		return m.ServerOffset+m.serverPageSize() < len(m.filteredServers())
 	case "servers-clear":
-		return len(f.Guilds) > 0
+		return len(*m.targetGuilds()) > 0
+	case "stats-prev":
+		return m.StatsOffset > 0
+	case "stats-next":
+		return m.StatsOffset+m.StatsPage < m.StatsTotal
 	case "search-apply":
 		return m.SearchInput.Value() != f.Search
 	case "servers-search":

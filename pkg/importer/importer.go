@@ -2,6 +2,7 @@ package importer
 
 import (
 	"archive/zip"
+	"cmp"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -206,6 +207,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		var messages []store.Message
 		messageBytes := 0
 		var metadata []store.ChannelObservation
+		var events []store.Event
 		observations := map[string]string{}
 		reported := int64(0)
 		lastProgress := time.Now()
@@ -230,6 +232,16 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			}
 			return e
 		}
+		flushEvents := func() error {
+			if len(events) == 0 {
+				return nil
+			}
+			e := s.Events(ctx, slot, events)
+			if e == nil {
+				events = events[:0]
+			}
+			return e
+		}
 		progress := func() error {
 			if time.Since(lastProgress) < 150*time.Millisecond {
 				return ctx.Err()
@@ -243,6 +255,9 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				return e
 			}
 			if e := flushMetadata(); e != nil {
+				return e
+			}
+			if e := flushEvents(); e != nil {
 				return e
 			}
 			publish(phase, false)
@@ -275,10 +290,14 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					if gid != "" {
 						kind = "guild"
 					}
-					if m["type"] == "DM" || m["type"] == "GROUP_DM" || m["type"] == "1" || m["type"] == "3" {
+					if m["type"] == "DM" || m["type"] == "1" {
 						kind = "dm"
 					}
-					metadata = append(metadata, store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Rank: 3})
+					observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Rank: 3}
+					if m["type"] == "GROUP_DM" || m["type"] == "3" {
+						observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: 3}
+					}
+					metadata = append(metadata, observation)
 				}
 			case 3:
 				id := m["id"]
@@ -307,16 +326,23 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				if digits(m["channel_id"]) && digits(m["guild_id"]) {
 					key := m["channel_id"]
 					value := m["guild_id"] + "\x00" + m["guild_name"] + "\x00" + m["channel_name"]
-					if observations[key] == value {
-						return nil
+					if observations[key] != value {
+						if len(observations) >= 16384 {
+							clear(observations)
+						}
+						observations[key] = value
+						metadata = append(metadata, store.ChannelObservation{ID: m["channel_id"], Name: m["channel_name"], Guild: m["guild_id"], Server: m["guild_name"], Kind: "guild", Rank: 2})
+						if len(metadata) >= 512 {
+							if e := flushMetadata(); e != nil {
+								return e
+							}
+						}
 					}
-					if len(observations) >= 16384 {
-						clear(observations)
-					}
-					observations[key] = value
-					metadata = append(metadata, store.ChannelObservation{ID: m["channel_id"], Name: m["channel_name"], Guild: m["guild_id"], Server: m["guild_name"], Kind: "guild", Rank: 2})
-					if len(metadata) >= 512 {
-						return flushMetadata()
+				}
+				if event, ok := activityEvent(m); ok {
+					events = append(events, event)
+					if len(events) >= 512 {
+						return flushEvents()
 					}
 				}
 			}
@@ -340,9 +366,22 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			d := json.NewDecoder(g)
 			d.UseNumber()
 			var root map[string]string
-			root, e = walk(d, 0, nil, nil)
+			names := map[string]string{}
+			var people func(map[string]string) error
+			if f.category == 0 {
+				people = func(m map[string]string) error {
+					if name := cmp.Or(m["global_name"], m["username"]); name != "" && digits(m["id"]) && len(names) < 1<<16 {
+						names[m["id"]] = name
+					}
+					return nil
+				}
+			}
+			root, e = walk(d, 0, people, nil)
 			if e == nil {
 				e = record(root)
+			}
+			if e == nil && len(names) > 0 {
+				e = s.Names(ctx, slot, names)
 			}
 			if e == nil {
 				_, e = d.Token()
@@ -372,7 +411,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		} else {
 			e = stream(g, record, field)
 		}
-		e = errors.Join(e, flushMessages(), flushMetadata(), r.Close())
+		e = errors.Join(e, flushMessages(), flushMetadata(), flushEvents(), r.Close())
 		if delta := g.bytes - reported; delta > 0 {
 			processed.Add(delta)
 		}

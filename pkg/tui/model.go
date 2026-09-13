@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"cmp"
 	"context"
 	"os"
 	"slices"
@@ -36,8 +37,10 @@ type incidentInputMsg struct {
 
 const (
 	tabInvestigate = iota
+	tabStats
 	tabConsole
 	tabLog
+	tabCount
 )
 
 type dataMsg struct {
@@ -108,6 +111,33 @@ type Model struct {
 	DropRevision, IncidentInputRevision           int
 	IncidentProcessing                            string
 	LastCommand                                   string
+	ServerSort, ServerTarget                      string
+	SnapshotKey                                   string
+	Stats                                         *store.Stats
+	StatsView, StatsRange, StatsLayout            string
+	StatsPalette, StatsCells, StatsScale          string
+	StatsEntity                                   string
+	StatsMetric                                   store.Metric
+	StatsGuilds                                   []string
+	StatsRevision, StatsShown                     int
+	StatsLoading                                  bool
+	StatsAt                                       time.Time
+	StatsOffset, StatsPage, StatsTotal            int
+	StatsScrollHeight                             int
+	StatsCursor                                   int
+	StatsRowCount                                 int
+	StatsScope                                    scope
+	StatsLeaders                                  []store.Leader
+	StatsTarget                                   store.Leader
+	StatsTargetMetric                             store.Metric
+	Menu                                          *menu
+	Figures                                       map[string]figureState
+	StatsRows                                     []store.Row
+	StatsRowsRevision                             int
+	StatsRowsLoading                              bool
+	ChannelLabel                                  string
+	HeatCursor                                    [2]int
+	Tips                                          map[string]string
 }
 
 func New(ctx context.Context, s *session.Session) *Model {
@@ -147,7 +177,26 @@ func New(ctx context.Context, s *session.Session) *Model {
 	after.Placeholder = "0"
 	after.PlaceholderStyle = days.PlaceholderStyle
 	after.CharLimit = 4
-	return &Model{Session: s, ctx: ctx, Zones: zone.New(), Width: 90, Height: 28, Input: input, ServerInput: serverInput, DayInput: days, SearchInput: search, RequestInput: request, BeforeInput: before, AfterInput: after, PackagesExpanded: true, Viewport: viewport.New(80, 15), Focus: "open-old", RequestScope: "all", FollowLog: true, ConsoleFollow: true}
+	return &Model{Session: s, ctx: ctx, Zones: zone.New(), Width: 90, Height: 28, Input: input, ServerInput: serverInput, DayInput: days, SearchInput: search, RequestInput: request, BeforeInput: before, AfterInput: after, PackagesExpanded: true, Viewport: viewport.New(80, 15), Focus: "open-old", RequestScope: "all", FollowLog: true, ConsoleFollow: true, ServerSort: "messages", ServerTarget: "filter", StatsView: "overview", StatsRange: "all", StatsLayout: "hours", StatsPalette: "violet", StatsCells: "blocks", StatsScale: "linear", StatsEntity: string(store.EntityServers), StatsRowCount: 8, Figures: map[string]figureState{}}
+}
+
+func (m *Model) targetGuilds() *[]string {
+	if m.ServerTarget == "stats" {
+		return &m.StatsGuilds
+	}
+	return &m.Session.Filter.Guilds
+}
+
+func (m *Model) sortServers() {
+	slices.SortStableFunc(m.Servers, func(a, b store.Group) int {
+		switch m.ServerSort {
+		case "name":
+			return cmp.Or(strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)), strings.Compare(a.ID, b.ID))
+		case "missing":
+			return cmp.Or(cmp.Compare(b.Missing, a.Missing), cmp.Compare(b.Count, a.Count), strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)))
+		}
+		return cmp.Or(cmp.Compare(b.Count, a.Count), strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)), strings.Compare(a.ID, b.ID))
+	})
 }
 func (m *Model) Init() tea.Cmd { return tea.Batch(textinput.Blink, tick(false), m.refresh()) }
 func tick(active bool) tea.Cmd {
@@ -177,17 +226,23 @@ func (m *Model) refresh() tea.Cmd {
 		if d.Err != nil {
 			return d
 		}
-		_, d.Warning = s.Compatible(ctx)
+		var comparable bool
+		comparable, d.Warning = s.Compatible(ctx)
 		full := f
 		full.Limit = 0
 		full.Offset = 0
 		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), IncidentSeconds: slices.Clone(full.IncidentSeconds), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
-		var filtered, matching []store.Row
-		var errs [3]error
+		missingFilter := matchingFilter
+		missingFilter.Mode = "missing"
+		var filtered, matching, missing []store.Row
+		var errs [4]error
 		var group sync.WaitGroup
 		group.Go(func() { filtered, errs[0] = s.Rows(ctx, full) })
 		group.Go(func() { matching, errs[1] = s.Rows(ctx, matchingFilter) })
 		group.Go(func() { d.Servers, errs[2] = s.Servers(ctx) })
+		if comparable {
+			group.Go(func() { missing, errs[3] = s.Rows(ctx, missingFilter) })
+		}
 		group.Wait()
 		for _, err := range errs {
 			if err != nil {
@@ -208,8 +263,13 @@ func (m *Model) refresh() tea.Cmd {
 		for _, g := range matchingGroups {
 			counts[g.ID] = g.Count
 		}
+		missingCounts := map[string]int{}
+		for _, g := range store.GroupRows(missing, false) {
+			missingCounts[g.ID] = g.Count
+		}
 		for i := range d.Servers {
 			d.Servers[i].Count = counts[d.Servers[i].ID]
+			d.Servers[i].Missing = missingCounts[d.Servers[i].ID]
 		}
 		if len(full.Dates) > 0 || len(full.IncidentSeconds) > 0 || full.From != "" || full.Until != "" {
 			d.Servers = slices.DeleteFunc(d.Servers, func(group store.Group) bool { return group.Count == 0 })
@@ -269,7 +329,7 @@ func (m *Model) run(line string) tea.Cmd {
 		return tea.Quit
 	}
 	m.LastCommand = a[0]
-	if slices.Contains([]string{"help", "list", "show", "stats", "days", "servers", "status"}, a[0]) {
+	if slices.Contains([]string{"help", "list", "show", "stats", "days", "servers", "status", "summary", "leaders", "heatmap"}, a[0]) {
 		m.Tab = tabConsole
 		m.Focus = "command"
 		m.Input.Focus()
@@ -283,7 +343,7 @@ func (m *Model) run(line string) tea.Cmd {
 	s := m.Session
 	ctx := m.ctx
 	// Output is bounded in the embedded console; CLI exports remain streaming.
-	if !slices.Contains([]string{"list", "show", "servers", "stats", "days", "request", "wait", "status", "sample", "open"}, a[0]) {
+	if !slices.Contains([]string{"list", "show", "servers", "stats", "days", "request", "wait", "status", "sample", "open", "summary", "leaders", "heatmap"}, a[0]) {
 		w := &consoleWriter{}
 		e := s.Execute(ctx, a, w)
 		return func() tea.Msg { return resultMsg{w.b.String(), e} }

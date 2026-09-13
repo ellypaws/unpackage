@@ -109,6 +109,28 @@ func (s *Session) Wait(ctx context.Context) error {
 	return nil
 }
 
+// RangeDays maps a statistics range key to a day count, zero meaning unbounded.
+func RangeDays(key string) int {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "", "all", "0":
+		return 0
+	case "year":
+		return 365
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(key))
+	if err != nil || n < 1 {
+		return 0
+	}
+	return min(n, 100000)
+}
+
+// RangeWindow covers the last N local days including today.
+func RangeWindow(days int, today time.Time) (time.Time, time.Time) {
+	today = today.In(time.Local)
+	start := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.Local)
+	return start.AddDate(0, 0, 1-days), start.AddDate(0, 0, 1)
+}
+
 func Split(line string) ([]string, error) {
 	var out []string
 	var b strings.Builder

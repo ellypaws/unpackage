@@ -53,6 +53,26 @@ rows high for the full-screen interface.
 The app keeps what it reads in memory for the current session. It does not change your source
 packages. Close the app to clear the loaded data.
 
+The Stats tab summarizes the loaded packages. Overview shows totals and top cards. Activity shows a
+weekday by hour grid, a calendar, or a month grid for any metric, with hover or arrow-key details on
+each cell and a choice of range, palette, cell style, and scale. Top shows cards of servers, channels,
+people, games, platforms, and emoji ranked by several metrics. Open a card for the full ranking by
+any metric. Hover a value for the exact figure, a duration in years, months, days, hours, and
+minutes, and its share of the total. Opening a ranked item follows the context: a server shows its
+channels by the same metric, a channel or person ranked by a message metric shows those messages
+newest first with a jump to Investigate, and anything ranked by voice, play, reaction, stream, or
+edit metrics shows its activity grid with a scope chip you can clear. Choices with more than two
+options open as dropdown menus; hovering an option previews it, Enter or a click applies it, and Esc
+or a click elsewhere closes it. Numbers that change flash by the size of the change and settle. Overview also reports words, links,
+attachments, average length, active days, longest streak, longest and average voice session, and
+edits and deletions recorded by Discord's own analytics. Ranges default to all time. Voice time, play time, app sessions, reactions,
+streams, and joined servers come from the package's Activity folder and appear once it finishes
+loading. Both packages are combined and identical events are counted once. Group conversations show
+their custom name with the participants in parentheses, or the participants' global names when the
+export includes them. The export does not list who was in a voice channel with you.
+
+The server picker sorts by message count. Use the sort control to switch to name or missing count.
+
 Use `Read from clipboard` in the Investigate tab after copying a Discord safety-notice message
 response. This avoids terminals that replay Ctrl+V input synchronously. Recognized responses apply
 every `incident_time` as an exact-second message filter. Clipboard contents are processed in memory
@@ -97,6 +117,7 @@ search "some text"
 list jsonl
 ```
 
+Use `summary`, `leaders servers missing`, or `heatmap voice-time all` for statistics in the console.
 Use `show MESSAGE_ID` for a complete row. Use `list jsonl` or `list tsv` to export the current
 results. Use `clear` to reset filters and `stop` to stop an import while keeping data already read.
 
@@ -126,7 +147,8 @@ Add `--format tsv` for tab-separated output. You can also use `--server ID`, `--
 
 ## Keyboard shortcuts
 
-`Tab` and `Shift+Tab` move focus. `Enter` activates a control. `Ctrl+Tab` switches tabs. `F1`
+`Tab` and `Shift+Tab` move focus. `Enter` activates a control. `Ctrl+Tab` switches tabs. In the
+Stats tab, arrow keys move across the activity grid once it has focus and scroll the leader list. `F1`
 opens help. `Ctrl+O`, `Ctrl+N`, and `Ctrl+D` open the older package, newer package, and calendar
 controls. `Ctrl+X` stops an import, `Esc` closes an open panel, and `Ctrl+C` exits.
 

@@ -250,6 +250,42 @@ func GradientColor(position float64) lipgloss.Color {
 	return gradientRamp[int(position*float64(len(gradientRamp)-1)+.5)]
 }
 
+// Palettes are single-hue sequential ramps from dim to bright for magnitude encodings.
+var Palettes = []string{"violet", "amber", "green", "cyan"}
+
+var paletteRamps = map[string][]lipgloss.Color{
+	"violet": buildRamp(gradientSteps, tone{262, .48, .34}, tone{258, .42, .66}, tone{248, .28, .98}),
+	"amber":  buildRamp(gradientSteps, tone{28, .62, .34}, tone{36, .78, .72}, tone{46, .52, 1}),
+	"green":  buildRamp(gradientSteps, tone{152, .55, .30}, tone{150, .58, .64}, tone{140, .40, .96}),
+	"cyan":   buildRamp(gradientSteps, tone{202, .55, .32}, tone{198, .58, .70}, tone{188, .34, .98}),
+}
+
+func PaletteColor(name string, position float64) lipgloss.Color {
+	ramp := paletteRamps[name]
+	if ramp == nil {
+		ramp = paletteRamps[Palettes[0]]
+	}
+	position = max(0, min(1, position))
+	return ramp[int(position*float64(len(ramp)-1)+.5)]
+}
+
+func buildRamp(steps int, stops ...tone) []lipgloss.Color {
+	if len(stops) < 2 {
+		return buildGradient(steps, stops[0], stops[0])
+	}
+	colors := make([]lipgloss.Color, 0, steps)
+	segments := len(stops) - 1
+	for i := range steps {
+		position := float64(i) / float64(max(1, steps-1)) * float64(segments)
+		segment := min(segments-1, int(position))
+		local := position - float64(segment)
+		start, end := stops[segment], stops[segment+1]
+		current := tone{h: start.h + (end.h-start.h)*local, s: start.s + (end.s-start.s)*local, v: start.v + (end.v-start.v)*local}
+		colors = append(colors, lipgloss.Color(current.rgb().hex()))
+	}
+	return colors
+}
+
 func Brightness(color lipgloss.Color, amount float64) lipgloss.Color {
 	return adjust(color, 0, amount)
 }
@@ -480,4 +516,59 @@ func Spark(ns []int) string {
 		b.WriteRune(glyphs[min(7, n*7/peak)])
 	}
 	return b.String()
+}
+
+// Overlay paints box over base at cell (x, y) without disturbing the surrounding layout.
+func Overlay(base, box string, x, y int) string {
+	lines := strings.Split(base, "\n")
+	boxLines := strings.Split(box, "\n")
+	boxWidth := lipgloss.Width(box)
+	for i, boxLine := range boxLines {
+		row := y + i
+		if row < 0 || row >= len(lines) {
+			continue
+		}
+		line := lines[row]
+		width := ansi.StringWidth(line)
+		left := ansi.Cut(line, 0, x)
+		if pad := x - ansi.StringWidth(left); pad > 0 {
+			left += strings.Repeat(" ", pad)
+		}
+		right := ""
+		if width > x+boxWidth {
+			right = ansi.Cut(line, x+boxWidth, width)
+		}
+		lines[row] = left + "\x1b[0m" + lipgloss.NewStyle().Width(boxWidth).Render(boxLine) + "\x1b[0m" + right
+	}
+	return strings.Join(lines, "\n")
+}
+
+func Tooltip(text string) string {
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(Accent).Background(Surface).Foreground(Text).Padding(0, 1).Render(text)
+}
+
+// Blend mixes two hex colors, with amount 0 giving a and 1 giving b.
+func Blend(a, b lipgloss.Color, amount float64) lipgloss.Color {
+	amount = max(0, min(1, amount))
+	from, okA := parseHex(a)
+	to, okB := parseHex(b)
+	if !okA || !okB {
+		return a
+	}
+	mix := func(x, y int) int { return int(float64(x) + (float64(y)-float64(x))*amount + .5) }
+	return lipgloss.Color(rgb{mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b)}.hex())
+}
+
+func parseHex(color lipgloss.Color) (rgb, bool) {
+	value := string(color)
+	if len(value) != 7 || value[0] != '#' {
+		return rgb{}, false
+	}
+	r, errR := strconv.ParseInt(value[1:3], 16, 0)
+	g, errG := strconv.ParseInt(value[3:5], 16, 0)
+	b, errB := strconv.ParseInt(value[5:7], 16, 0)
+	if errR != nil || errG != nil || errB != nil {
+		return rgb{}, false
+	}
+	return rgb{int(r), int(g), int(b)}, true
 }

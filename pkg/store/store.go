@@ -18,6 +18,33 @@ type Store struct {
 	messages  [2]map[string]Message
 	channels  [2]map[string]channel
 	byDate    [2]map[string][]string
+	events    [2]map[string]Event
+	names     [2]map[string]string
+	interned  map[string]string
+}
+
+type EventKind uint8
+
+const (
+	EventVoiceJoin EventKind = iota + 1
+	EventVoice
+	EventGame
+	EventSession
+	EventReaction
+	EventGuildJoin
+	EventStream
+	EventEdit
+	EventDelete
+)
+
+// Event is one analytics record kept for statistics; Duration is the voice or play time it reports.
+type Event struct {
+	ID              string
+	Kind            EventKind
+	Time            time.Time
+	Guild, Channel  string
+	Name, Platform  string
+	Duration, Total time.Duration
 }
 type Message struct {
 	ID, Channel, Date, Content string
@@ -26,6 +53,7 @@ type Message struct {
 }
 type ChannelObservation struct {
 	ID, Name, Guild, Server, Kind string
+	Title, Recipients             string
 	Rank                          int
 }
 type Row struct {
@@ -45,6 +73,7 @@ type Row struct {
 type Group struct {
 	ID, Name string
 	Count    int
+	Missing  int
 }
 type Filter struct {
 	Mode, Search, Channel, Kind, Media string
@@ -63,6 +92,7 @@ type Snapshot struct {
 }
 type channel struct {
 	name, guild, server, kind string
+	title, recipients         string
 	nameRank, guildRank       int
 	serverRank, kindRank      int
 	conflict                  bool
@@ -82,6 +112,8 @@ func (s *Store) Clear(slot int) {
 	s.messages[slot] = nil
 	s.channels[slot] = nil
 	s.byDate[slot] = nil
+	s.events[slot] = nil
+	s.names[slot] = nil
 }
 func (s *Store) Reset(ctx context.Context, slot int) error {
 	if e := ctx.Err(); e != nil {
@@ -96,7 +128,120 @@ func (s *Store) Reset(ctx context.Context, slot int) error {
 	s.messages[slot] = map[string]Message{}
 	s.channels[slot] = map[string]channel{}
 	s.byDate[slot] = map[string][]string{}
+	s.events[slot] = map[string]Event{}
+	s.names[slot] = map[string]string{}
 	return nil
+}
+
+// Names records account display names keyed by user ID so group conversations can list their participants.
+func (s *Store) Names(ctx context.Context, slot int, names map[string]string) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.names[slot] == nil {
+		return fmt.Errorf("slot is not open")
+	}
+	for id, name := range names {
+		if len(name) > 256 || len(s.names[slot]) >= 1<<16 {
+			continue
+		}
+		s.names[slot][id] = name
+	}
+	return nil
+}
+
+func (s *Store) nameLookupLocked() func(string) string {
+	return func(id string) string {
+		for _, names := range s.names {
+			if name := names[id]; name != "" {
+				return name
+			}
+		}
+		return ""
+	}
+}
+
+// channelLabel names a channel for display; group conversations list their participants by global name.
+func channelLabel(c channel, id string, lookup func(string) string) string {
+	if c.kind != "group" {
+		return cmp.Or(c.name, id)
+	}
+	participants := c.name
+	if participants == "" && c.recipients != "" {
+		var names []string
+		for recipient := range strings.SplitSeq(c.recipients, "\n") {
+			if name := lookup(recipient); name != "" {
+				names = append(names, name)
+			} else if !digits(recipient) && recipient != "" {
+				names = append(names, recipient)
+			}
+		}
+		participants = strings.Join(names, ", ")
+	}
+	switch {
+	case c.title != "" && participants != "":
+		return c.title + " (" + participants + ")"
+	case c.title != "":
+		return c.title
+	case participants != "":
+		return participants
+	}
+	if n := strings.Count(c.recipients, "\n") + 1; c.recipients != "" && n > 1 {
+		return fmt.Sprintf("Group of %d", n)
+	}
+	return id
+}
+
+func digits(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+func (s *Store) Events(ctx context.Context, slot int, events []Event) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.events[slot] == nil {
+		return fmt.Errorf("slot is not open")
+	}
+	if s.interned == nil {
+		s.interned = map[string]string{}
+	}
+	for _, e := range events {
+		if e.ID == "" || e.Kind == 0 {
+			continue
+		}
+		e.Guild = s.intern(e.Guild)
+		e.Channel = s.intern(e.Channel)
+		e.Name = s.intern(e.Name)
+		e.Platform = s.intern(e.Platform)
+		s.events[slot][e.ID] = e
+	}
+	return nil
+}
+
+// Analytics files repeat the same guild, channel, and application strings millions of times.
+func (s *Store) intern(v string) string {
+	if v == "" {
+		return ""
+	}
+	if existing, ok := s.interned[v]; ok {
+		return existing
+	}
+	if len(s.interned) < 1<<20 {
+		s.interned[v] = v
+	}
+	return v
 }
 func (s *Store) SetSnapshot(slot int, v Snapshot) {
 	s.mu.Lock()
@@ -140,6 +285,10 @@ func merge(a, b channel) channel {
 		a.server = b.server
 		a.serverRank = b.serverRank
 	}
+	a.title = cmp.Or(a.title, b.title)
+	if len(b.recipients) > len(a.recipients) {
+		a.recipients = b.recipients
+	}
 	if a.kind == "dm" && b.kind == "unknown-dm" || a.kind == "unknown-dm" && b.kind == "dm" {
 		a.kind = "unknown-dm"
 		a.kindRank = max(a.kindRank, b.kindRank)
@@ -154,8 +303,8 @@ func preferField(current string, currentRank int, candidate string, candidateRan
 	return candidate != "" && (current == "" || candidateRank > currentRank || candidateRank == currentRank && strings.Compare(candidate, current) < 0)
 }
 
-func channelObservation(name, guild, server, kind string, rank int) channel {
-	c := channel{name: name, guild: guild, server: server, kind: kind}
+func channelObservation(name, guild, server, kind, title, recipients string, rank int) channel {
+	c := channel{name: name, guild: guild, server: server, kind: kind, title: title, recipients: recipients}
 	if name != "" {
 		c.nameRank = rank
 	}
@@ -227,14 +376,14 @@ func applyServerLabel(c channel, labels map[string]serverLabel) channel {
 	return c
 }
 func (s *Store) Channel(ctx context.Context, slot int, id, name, guild, server, kind string, rank int) error {
-	return s.Channels(ctx, slot, []ChannelObservation{{id, name, guild, server, kind, rank}})
+	return s.Channels(ctx, slot, []ChannelObservation{{ID: id, Name: name, Guild: guild, Server: server, Kind: kind, Rank: rank}})
 }
 func (s *Store) Channels(ctx context.Context, slot int, observations []ChannelObservation) error {
 	if e := ctx.Err(); e != nil {
 		return e
 	}
 	for _, observation := range observations {
-		if len(observation.Name) > 4096 || len(observation.Server) > 4096 {
+		if len(observation.Name) > 4096 || len(observation.Server) > 4096 || len(observation.Title) > 4096 || len(observation.Recipients) > 4096 {
 			return fmt.Errorf("channel name too long")
 		}
 	}
@@ -244,7 +393,7 @@ func (s *Store) Channels(ctx context.Context, slot int, observations []ChannelOb
 		if observation.ID == "" {
 			continue
 		}
-		s.channels[slot][observation.ID] = merge(s.channels[slot][observation.ID], channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Rank))
+		s.channels[slot][observation.ID] = merge(s.channels[slot][observation.ID], channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank))
 	}
 	return nil
 }
@@ -314,6 +463,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	ok, why := compatible(a, b)
 	same := sameOwner(a, b)
 	labels := serverLabels(s.effectiveChannelsLocked(same))
+	lookup := s.nameLookupLocked()
 	mode := f.Mode
 	if mode == "" || mode == "auto" {
 		mode = "all"
@@ -336,10 +486,12 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	type item struct {
 		m       Message
 		c       channel
+		name    string
 		missing bool
 	}
 	var items []item
 	for slot, ms := range s.messages {
+		labelled := map[string]string{}
 		if mode == "older" && slot != 0 || mode == "newer" && slot != 1 || mode == "new" && slot != 1 || (mode == "missing" || mode == "present") && slot != 0 {
 			continue
 		}
@@ -393,7 +545,12 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				c = merge(s.channels[0][m.Channel], s.channels[1][m.Channel])
 			}
 			c = applyServerLabel(c, labels)
-			items = append(items, item{m: m, c: c, missing: same && slot == 0 && !inNew})
+			name, cached := labelled[m.Channel]
+			if !cached {
+				name = channelLabel(c, m.Channel, lookup)
+				labelled[m.Channel] = name
+			}
+			items = append(items, item{m: m, c: c, name: name, missing: same && slot == 0 && !inNew})
 		}
 	}
 	s.mu.RUnlock()
@@ -424,6 +581,8 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				server = "Direct messages"
 			case "unknown-dm":
 				server = "Unknown participants"
+			case "group":
+				server = "Group messages"
 			default:
 				server = "Unknown server"
 			}
@@ -434,7 +593,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		} else if mode == "present" || mode == "new" {
 			status = mode
 		}
-		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: cmp.Or(c.name, m.Channel), Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs)})
+		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: v.name, Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs)})
 	}
 	slices.SortFunc(rows, func(a, b Row) int {
 		return cmp.Or(strings.Compare(a.Date, b.Date), cmp.Compare(len(a.ID), len(b.ID)), strings.Compare(a.ID, b.ID))
@@ -481,7 +640,7 @@ func GroupRows(rows []Row, dates bool) []Group {
 	}
 	out := make([]Group, 0, len(counts))
 	for k, n := range counts {
-		out = append(out, Group{k[0], k[1], n})
+		out = append(out, Group{ID: k[0], Name: k[1], Count: n})
 	}
 	slices.SortFunc(out, func(a, b Group) int {
 		return cmp.Or(cmp.Compare(b.Count, a.Count), strings.Compare(a.ID, b.ID), strings.Compare(a.Name, b.Name))
