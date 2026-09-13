@@ -337,13 +337,15 @@ func TitleRule(title string, width, frame int, active bool) string {
 	return FitStyled(left+" "+styledTitle+" "+right, width)
 }
 
-func TitledBox(title, body string, width, padding int, border lipgloss.Border, color lipgloss.Color, frame int, active bool) string {
+func TitledBox(title, body string, width, padding int, border lipgloss.Border, color, titleColor lipgloss.Color, frame int, active bool) string {
 	width = max(6, width)
 	padding = max(0, padding)
 	contentWidth := max(1, width-2-padding*2)
 	title = Fit(title, max(1, width-7))
 	styledTitle := Gradient(title)
-	if active {
+	if titleColor != "" {
+		styledTitle = lipgloss.NewStyle().Foreground(titleColor).Bold(true).Render(title)
+	} else if active {
 		styledTitle = Shimmer(title, frame)
 	}
 

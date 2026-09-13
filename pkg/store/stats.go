@@ -397,8 +397,7 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			if f.Channel != "" && m.Channel != f.Channel {
 				continue
 			}
-			c := channels[m.Channel]
-			c = merge(c, channelObservation("", sent.Guild, "", "guild", "", "", 2))
+			c := merge(channels[m.Channel], sentChannel(sent))
 			if !matchesGuild(c.guild) {
 				continue
 			}

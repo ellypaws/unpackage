@@ -88,7 +88,7 @@ func (m *Model) modal(title, body string) string {
 		border = components.Brightness(border, .06)
 	}
 	width := min(m.Width-2, max(lipgloss.Width(body)+6, lipgloss.Width(title)+7))
-	panel := components.TitledBox(title, body, width, 2, lipgloss.RoundedBorder(), border, m.Frame, m.workLabel() != "")
+	panel := components.TitledBox(title, body, width, 2, lipgloss.RoundedBorder(), border, "", m.Frame, m.workLabel() != "")
 	return m.Zones.Scan(m.overlayMenu(lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, panel)))
 }
 
@@ -471,7 +471,7 @@ func (m *Model) packageBox(slot, width int) string {
 	}
 	m.Actions = append(m.Actions, id)
 	body := components.FitStyled(name, inner) + "\n" + buttons
-	return m.Zones.Mark(id, components.TitledBox(label, body, width, 2, b, border, m.Frame, snapshot != nil && snapshot.State == "loading"))
+	return m.Zones.Mark(id, components.TitledBox(label, body, width, 2, b, border, "", m.Frame, snapshot != nil && snapshot.State == "loading"))
 }
 func number(n int) string {
 	s := fmt.Sprint(n)

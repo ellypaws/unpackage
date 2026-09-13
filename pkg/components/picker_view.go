@@ -147,7 +147,7 @@ func (p *Picker) View(z *zone.Manager, width int, hover, focus string, frame int
 	}
 	label := "Choose this package (" + Fit(name, max(1, inner-35)) + ")"
 	b.WriteString("\n\n" + p.button(z, "pick-use", label, hover, focus, true) + " " + p.button(z, "pick-close", "Cancel", hover, focus, false) + "\n")
-	return TitledBox("Choose a package", b.String(), width, 2, lipgloss.RoundedBorder(), GradientColor(.46), frame, busy)
+	return TitledBox("Choose a package", b.String(), width, 2, lipgloss.RoundedBorder(), GradientColor(.46), "", frame, busy)
 }
 
 func (p *Picker) columnView(z *zone.Manager, bound columnBounds, hover, focus string, frame int) string {

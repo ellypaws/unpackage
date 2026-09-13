@@ -93,6 +93,19 @@ func activityChannel(m map[string]string) (string, string) {
 	return channel, guild
 }
 
+func activityChannelKind(m map[string]string, guild string) string {
+	switch m["channel_type"] {
+	case "1":
+		return "dm"
+	case "3":
+		return "group"
+	}
+	if guild != "" {
+		return "guild"
+	}
+	return ""
+}
+
 func activityCount(v string) int {
 	return int(min(integer(v), 1<<31-1))
 }
@@ -112,6 +125,7 @@ func activitySentMessage(m map[string]string, source store.ActivitySource) (stor
 		EventID:     eventID,
 		Channel:     channel,
 		Guild:       guild,
+		Kind:        activityChannelKind(m, guild),
 		Time:        at,
 		Platform:    platform(m["os"], m["browser"]),
 		Length:      activityCount(m["length"]),

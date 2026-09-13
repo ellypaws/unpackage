@@ -62,10 +62,10 @@ packages. Close the app to clear the loaded data.
 The Stats tab summarizes the loaded packages. Overview shows totals and top cards. Activity shows a
 weekday by hour grid, a calendar, or a month grid for any metric, with hover or arrow-key details on
 each cell and a choice of range, palette, cell style, and scale. Top shows cards of servers, channels,
-people, games, platforms, and emoji ranked by several metrics. Open a card for the full ranking by
+conversations, games, platforms, and emoji ranked by several metrics. Open a card for the full ranking by
 any metric. Hover a value for the exact figure, a duration in years, months, days, hours, and
 minutes, and its share of the total. Opening a ranked item follows the context: a server shows its
-channels by the same metric, a channel or person ranked by a message metric shows those messages
+channels by the same metric, a channel or conversation ranked by a message metric shows those messages
 newest first with a jump to Investigate, and anything ranked by voice, play, reaction, stream, or
 edit metrics shows its activity grid with a scope chip you can clear. Choices with more than two
 options open as dropdown menus; hovering an option previews it, Enter or a click applies it, and Esc

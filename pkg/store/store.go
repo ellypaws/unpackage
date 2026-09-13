@@ -76,6 +76,7 @@ type Event struct {
 // SentMessage is the metadata Discord retains for a send_message analytics event.
 type SentMessage struct {
 	ID, EventID, Channel, Guild string
+	Kind                        string
 	Time                        time.Time
 	Platform                    string
 	Length, Words               int
@@ -337,6 +338,7 @@ func mergeSentMessage(a, b SentMessage) SentMessage {
 	a.EventID = mergeText(a.EventID, b.EventID)
 	a.Channel = mergeText(a.Channel, b.Channel)
 	a.Guild = mergeText(a.Guild, b.Guild)
+	a.Kind = mergeText(a.Kind, b.Kind)
 	a.Platform = mergeDescription(a.Platform, b.Platform)
 	if a.Time.IsZero() || !b.Time.IsZero() && b.Time.Before(a.Time) {
 		a.Time = b.Time
@@ -348,6 +350,14 @@ func mergeSentMessage(a, b SentMessage) SentMessage {
 	a.HasMedia = a.HasMedia || b.HasMedia
 	a.Sources |= b.Sources
 	return a
+}
+
+func sentChannel(sent SentMessage) channel {
+	kind := sent.Kind
+	if kind == "" && sent.Guild != "" {
+		kind = "guild"
+	}
+	return channelObservation("", sent.Guild, "", kind, "", "", 2)
 }
 
 // SentMessages merges repeated send_message records from Activity files by message ID.
@@ -894,7 +904,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			if same {
 				c = merge(s.channels[0][m.Channel], s.channels[1][m.Channel])
 			}
-			c = merge(c, channelObservation("", sent.Guild, "", "guild", "", "", 2))
+			c = merge(c, sentChannel(sent))
 			c = applyServerLabel(c, labels)
 			name, cached := labelled[m.Channel]
 			if !cached {

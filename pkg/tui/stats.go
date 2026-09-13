@@ -44,7 +44,7 @@ var (
 	statsPalettes  = []option{{"violet", "Violet"}, {"amber", "Amber"}, {"green", "Green"}, {"cyan", "Cyan"}}
 	statsRowCounts = []option{{"5", "5 rows"}, {"8", "8 rows"}, {"12", "12 rows"}, {"20", "20 rows"}}
 	serverSorts    = []option{{"messages", "Sort by messages"}, {"name", "Sort by name"}, {"missing", "Sort by missing"}}
-	entityLabels   = map[store.Entity]string{store.EntityServers: "Servers", store.EntityChannels: "Channels", store.EntityPeople: "People", store.EntityGames: "Games", store.EntityPlatforms: "Platforms", store.EntityEmoji: "Emoji"}
+	entityLabels   = map[store.Entity]string{store.EntityServers: "Servers", store.EntityChannels: "Channels", store.EntityPeople: "Conversations", store.EntityGames: "Games", store.EntityPlatforms: "Platforms", store.EntityEmoji: "Emoji"}
 	weekdays       = []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
 	weekdayNames   = []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 	topBoards      = []boardSpec{{"", store.EntityServers, store.MetricMessages}, {"", store.EntityServers, store.MetricVoiceTime}, {"", store.EntityServers, store.MetricMissing}, {"", store.EntityChannels, store.MetricMessages}, {"", store.EntityChannels, store.MetricMedia}, {"", store.EntityChannels, store.MetricLinks}, {"", store.EntityPeople, store.MetricMessages}, {"", store.EntityPeople, store.MetricVoiceTime}, {"", store.EntityPeople, store.MetricWords}, {"", store.EntityGames, store.MetricPlayTime}, {"", store.EntityPlatforms, store.MetricSessions}, {"", store.EntityEmoji, store.MetricReactions}}
@@ -602,13 +602,18 @@ func (m *Model) blocks(rows []string, w, h int) string {
 
 func (m *Model) card(id, title, body string, width int) string {
 	border := components.GradientColor(.48)
+	var titleColor lipgloss.Color
 	if id != "" {
 		m.Actions = append(m.Actions, id)
+		title = "▸ " + title
+		border = components.Accent
+		titleColor = components.Accent
 		if m.Hover == id || m.Focus == id {
-			border = components.Brightness(components.Saturation(components.GradientColor(.82), .06), .06)
+			border = components.Pink
+			titleColor = components.Pink
 		}
 	}
-	box := components.TitledBox(title, body, width, 1, lipgloss.RoundedBorder(), border, m.Frame, false)
+	box := components.TitledBox(title, body, width, 1, lipgloss.RoundedBorder(), border, titleColor, m.Frame, false)
 	if id == "" {
 		return box
 	}
@@ -623,14 +628,15 @@ type boardSpec struct {
 
 func (m *Model) boardCard(spec boardSpec, width int, limit int) string {
 	muted := lipgloss.NewStyle().Foreground(components.Muted)
-	leaders := m.topLeaders(spec.entity, spec.metric, limit)
+	allLeaders := m.topLeaders(spec.entity, spec.metric, 1<<20)
+	leaders := allLeaders[:min(limit, len(allLeaders))]
 	inner := max(8, width-4)
 	var lines []string
 	if len(leaders) == 0 {
 		lines = append(lines, muted.Render("No data"))
 	}
 	total := 0
-	for _, l := range m.Stats.Leaders(spec.entity) {
+	for _, l := range allLeaders {
 		total += l.Values[spec.metric]
 	}
 	valueWidth := 0
@@ -671,6 +677,18 @@ func (m *Model) boardCard(spec boardSpec, width int, limit int) string {
 		rowID := "crow-" + prefix + strconv.Itoa(i)
 		m.HoverOnly = append(m.HoverOnly, rowID)
 		lines = append(lines, m.Zones.Mark(rowID, line))
+	}
+	if remaining := len(allLeaders) - len(leaders); remaining > 0 {
+		remainingTotal := 0
+		for _, l := range allLeaders[len(leaders):] {
+			remainingTotal += l.Values[spec.metric]
+		}
+		label := fmt.Sprintf("…%s more", number(remaining))
+		value := components.Fit(metricUnit(spec.metric, remainingTotal), max(1, inner-5))
+		labelWidth := max(4, inner-lipgloss.Width(value)-1)
+		label = components.Fit(label, labelWidth)
+		line := label + strings.Repeat(" ", max(1, labelWidth-lipgloss.Width(label)+1)) + value
+		lines = append(lines, muted.Render(line))
 	}
 	title := spec.title
 	if title == "" {
@@ -780,8 +798,8 @@ func (m *Model) overview(w, h int) string {
 	}
 	servers := len(m.topLeaders(store.EntityServers, store.MetricMessages, 1<<20))
 	channels := len(m.topLeaders(store.EntityChannels, store.MetricMessages, 1<<20))
-	people := len(m.topLeaders(store.EntityPeople, store.MetricMessages, 1<<20))
-	community := []tile{{"Servers", number(servers), "servers with messages", servers}, {"Channels", number(channels), "channels with messages", channels}, {"People", number(people), "direct and group conversations with messages", people}, {"Servers joined", number(st.Joined), "", st.Joined}, count(store.MetricReactions)}
+	conversations := len(m.topLeaders(store.EntityPeople, store.MetricMessages, 1<<20))
+	community := []tile{{"Servers", number(servers), "servers with messages", servers}, {"Channels", number(channels), "channels with messages", channels}, {"Conversations", number(conversations), "direct and group conversations with messages", conversations}, {"Servers joined", number(st.Joined), "", st.Joined}, count(store.MetricReactions)}
 	if top := m.topLeaders(store.EntityEmoji, store.MetricReactions, 1); len(top) > 0 {
 		community = append(community, tile{"Top emoji", leaderName(top[0]), metricUnit(store.MetricReactions, top[0].Values[store.MetricReactions]), top[0].Values[store.MetricReactions]})
 	}
@@ -803,7 +821,7 @@ func (m *Model) overview(w, h int) string {
 	} else {
 		rows = append(rows, groups...)
 	}
-	boards := []boardSpec{{"Top servers", store.EntityServers, store.MetricMessages}, {"Top people", store.EntityPeople, store.MetricMessages}, {"Top games", store.EntityGames, store.MetricPlayTime}, {"Most voice time", store.EntityServers, store.MetricVoiceTime}, {"Most missing", store.EntityServers, store.MetricMissing}, {"Most media", store.EntityChannels, store.MetricMedia}, {"Most words", store.EntityPeople, store.MetricWords}, {"Most links", store.EntityChannels, store.MetricLinks}, {"Most edited", store.EntityChannels, store.MetricEdits}}
+	boards := []boardSpec{{"Top servers", store.EntityServers, store.MetricMessages}, {"Top conversations", store.EntityPeople, store.MetricMessages}, {"Top games", store.EntityGames, store.MetricPlayTime}, {"Most voice time", store.EntityServers, store.MetricVoiceTime}, {"Most missing", store.EntityServers, store.MetricMissing}, {"Most media", store.EntityChannels, store.MetricMedia}, {"Most words", store.EntityPeople, store.MetricWords}, {"Most links", store.EntityChannels, store.MetricLinks}, {"Most edited", store.EntityChannels, store.MetricEdits}}
 	rows = append(rows, m.cardRows(boards, cw, overviewRows)...)
 	return m.blocks(rows, w, h)
 }
@@ -825,7 +843,7 @@ func (m *Model) topLeaders(entity store.Entity, metric store.Metric, limit int) 
 
 func entityNoun(entity store.Entity, n int) string {
 	if n == 1 {
-		return map[store.Entity]string{store.EntityServers: "server", store.EntityChannels: "channel", store.EntityPeople: "person", store.EntityGames: "game", store.EntityPlatforms: "platform", store.EntityEmoji: "emoji"}[entity]
+		return map[store.Entity]string{store.EntityServers: "server", store.EntityChannels: "channel", store.EntityPeople: "conversation", store.EntityGames: "game", store.EntityPlatforms: "platform", store.EntityEmoji: "emoji"}[entity]
 	}
 	return strings.ToLower(entityLabels[entity])
 }
