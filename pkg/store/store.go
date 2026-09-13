@@ -78,7 +78,7 @@ type Group struct {
 type Filter struct {
 	Mode, Search, Channel, Kind, Media string
 	Guilds, Dates                      []string
-	IncidentSeconds                    []int64
+	IncidentSeconds                    map[int64]int64
 	From, Until                        string
 	Limit, Offset                      int
 	DateBefore, DateAfter              int
@@ -451,7 +451,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	}
 	incidentSeconds := make(map[int64]bool, len(f.IncidentSeconds))
 	incidentDays := make(map[string]bool, len(f.IncidentSeconds))
-	for _, second := range f.IncidentSeconds {
+	for second := range f.IncidentSeconds {
 		if second <= 0 {
 			return nil, fmt.Errorf("invalid incident time")
 		}

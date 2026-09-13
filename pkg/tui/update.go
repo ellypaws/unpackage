@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -51,7 +52,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		m.Session.Filter.IncidentSeconds = v.Seconds
+		merged := maps.Clone(m.Session.Filter.IncidentSeconds)
+		if merged == nil {
+			merged = map[int64]int64{}
+		}
+		maps.Copy(merged, v.Seconds)
+		added := len(merged) - len(m.Session.Filter.IncidentSeconds)
+		m.Session.Filter.IncidentSeconds = merged
 		m.Session.Filter.Dates = nil
 		m.Session.Filter.From = ""
 		m.Session.Filter.Until = ""
@@ -59,7 +66,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Session.Filter.DateAfter = 0
 		m.Input.SetValue("")
 		m.DayInput.SetValue("")
-		m.Notice = fmt.Sprintf("Applied %d exact incident times", len(v.Seconds))
+		m.Notice = fmt.Sprintf("Added %d incident times, %d total", added, len(merged))
+		if added == 0 {
+			m.Notice = fmt.Sprintf("No new incident times, %d total", len(merged))
+		}
 		return m, m.changed()
 	case dropCheckMsg:
 		if v.Revision != m.DropRevision {

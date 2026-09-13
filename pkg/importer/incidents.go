@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -14,6 +13,7 @@ import (
 const maxIncidentPasteBytes = 8 << 20
 
 type incidentMessage struct {
+	ID     string `json:"id"`
 	Embeds []struct {
 		Type   string `json:"type"`
 		Fields []struct {
@@ -23,8 +23,9 @@ type incidentMessage struct {
 	} `json:"embeds"`
 }
 
-// IncidentSecondsJSON recognizes copied Discord safety-notice responses.
-func IncidentSecondsJSON(data []byte) ([]int64, bool, error) {
+// IncidentSecondsJSON recognizes copied Discord safety-notice responses and
+// maps each incident second to the id of the notice message that reported it.
+func IncidentSecondsJSON(data []byte) (map[int64]int64, bool, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
 		return nil, false, nil
@@ -38,7 +39,7 @@ func IncidentSecondsJSON(data []byte) ([]int64, bool, error) {
 	if err != nil || token != json.Delim('[') {
 		return nil, false, nil
 	}
-	seen := map[int64]bool{}
+	seen := map[int64]int64{}
 	recognized := false
 	for decoder.More() {
 		var message incidentMessage
@@ -53,6 +54,10 @@ func IncidentSecondsJSON(data []byte) ([]int64, bool, error) {
 				continue
 			}
 			recognized = true
+			messageID, idErr := strconv.ParseInt(message.ID, 10, 64)
+			if idErr != nil || messageID <= 0 {
+				return nil, true, fmt.Errorf("safety notice has no message id")
+			}
 			found := false
 			for _, field := range embed.Fields {
 				if field.Name != "incident_time" {
@@ -62,7 +67,7 @@ func IncidentSecondsJSON(data []byte) ([]int64, bool, error) {
 				if parseErr != nil {
 					return nil, true, parseErr
 				}
-				seen[second] = true
+				seen[second] = messageID
 				found = true
 			}
 			if !found {
@@ -86,12 +91,7 @@ func IncidentSecondsJSON(data []byte) ([]int64, bool, error) {
 	if !recognized {
 		return nil, false, nil
 	}
-	seconds := make([]int64, 0, len(seen))
-	for second := range seen {
-		seconds = append(seconds, second)
-	}
-	slices.Sort(seconds)
-	return seconds, true, nil
+	return seen, true, nil
 }
 
 func incidentSecond(value string) (int64, error) {

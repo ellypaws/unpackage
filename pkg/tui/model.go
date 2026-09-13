@@ -3,6 +3,7 @@ package tui
 import (
 	"cmp"
 	"context"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -28,7 +29,7 @@ type searchMsg struct {
 	Value    string
 }
 type incidentInputMsg struct {
-	Seconds    []int64
+	Seconds    map[int64]int64
 	Recognized bool
 	Clipboard  bool
 	Err        error
@@ -214,7 +215,7 @@ func (m *Model) refresh() tea.Cmd {
 	f := m.Session.Filter
 	f.Guilds = slices.Clone(f.Guilds)
 	f.Dates = slices.Clone(f.Dates)
-	f.IncidentSeconds = slices.Clone(f.IncidentSeconds)
+	f.IncidentSeconds = maps.Clone(f.IncidentSeconds)
 	f.Limit = m.pageSize()
 	f.Offset = m.Offset
 	revision := m.Revision
@@ -231,7 +232,7 @@ func (m *Model) refresh() tea.Cmd {
 		full := f
 		full.Limit = 0
 		full.Offset = 0
-		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), IncidentSeconds: slices.Clone(full.IncidentSeconds), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
+		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), IncidentSeconds: maps.Clone(full.IncidentSeconds), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
 		missingFilter := matchingFilter
 		missingFilter.Mode = "missing"
 		var filtered, matching, missing []store.Row

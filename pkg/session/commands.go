@@ -63,7 +63,7 @@ package sample DIRECTORY [MESSAGE_COUNT]
 
 Dates use local time. Quote paths with spaces.
 Statistics commands use the selected servers and combine both packages.
-Use Read from clipboard in Investigate to filter exact incident seconds.
+Use Paste from clipboard in Investigate to filter exact incident seconds.
 Request requires selected server IDs; all ignores other filters.
 Missing means absent from the newer export, not proof of deletion.`
 

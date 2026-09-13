@@ -488,15 +488,17 @@ func (m *Model) investigate(w, h int) string {
 	return box.Render()
 }
 func (m *Model) filters(w int) string {
-	parts := []string{m.field("search-input", &m.SearchInput, min(36, w)), components.Title.Render("Message dates"), m.button("clipboard", "Read from clipboard", false), m.field("days-input", &m.DayInput, min(34, w))}
+	parts := []string{m.field("search-input", &m.SearchInput, min(36, w)), components.Title.Render("Message dates"), m.button("clipboard", "Paste from clipboard", false), m.field("days-input", &m.DayInput, min(34, w))}
 	parts = append(parts, m.button("dates", "Choose dates", false)+" "+m.button("dates-clear", "Clear", false))
 	parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Separate multiple dates with ;"))
 	dates := m.Session.Filter.Dates
 	incidents := m.Session.Filter.IncidentSeconds
 	if len(incidents) > 0 {
-		label := "Exact: " + time.Unix(incidents[0], 0).In(time.Local).Format("2006-01-02 15:04:05")
-		if len(incidents) > 1 {
-			label = fmt.Sprintf("%d exact incident times", len(incidents))
+		label := fmt.Sprintf("%d exact incident times", len(incidents))
+		if len(incidents) == 1 {
+			for second := range incidents {
+				label = "Exact: " + time.Unix(second, 0).In(time.Local).Format("2006-01-02 15:04:05")
+			}
 		}
 		parts = append(parts, lipgloss.NewStyle().Foreground(components.Accent).Render(label))
 	} else if len(dates) == 0 {

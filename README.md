@@ -73,10 +73,11 @@ export includes them. The export does not list who was in a voice channel with y
 
 The server picker sorts by message count. Use the sort control to switch to name or missing count.
 
-Use `Read from clipboard` in the Investigate tab after copying a Discord safety-notice message
-response. This avoids terminals that replay Ctrl+V input synchronously. Recognized responses apply
-every `incident_time` as an exact-second message filter. Clipboard contents are processed in memory
-and are not shown in the command console or written to logs.
+Use `Paste from clipboard` in the Investigate tab after copying a Discord safety-notice message
+response. This avoids terminals that replay Ctrl+V input synchronously. Recognized responses add
+every `incident_time` to the exact-second message filter, so repeated pastes accumulate and
+duplicate times are ignored. Clipboard contents are processed in memory and are not shown in the
+command console or written to logs.
 
 The package browser keeps parent folders visible in columns. Hover a narrow column to expand it.
 Type part of a folder name to filter and highlight fuzzy matches, then use `Tab` to complete the
