@@ -36,7 +36,7 @@ func (m *Model) enabled(id string) bool {
 	case "clipboard":
 		return m.IncidentProcessing == ""
 	case "clear":
-		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || f.Channel != "" || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
+		return len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0 || f.From != "" || f.Until != "" || f.Search != "" || f.Media != "" || f.Mode != "auto" || f.DateBefore != 0 || f.DateAfter != 0 || f.Channel != "" || f.HideEventOnly || m.DayInput.Value() != "" || m.SearchInput.Value() != ""
 	case "previous":
 		return m.Offset > 0 && !m.Loading
 	case "next":

@@ -179,6 +179,7 @@ func (m *Model) openMessages(l store.Leader, metric store.Metric) tea.Cmd {
 	ctx := m.ctx
 	return func() tea.Msg {
 		rows, err := s.Rows(ctx, f)
+		rows = slices.Clone(rows)
 		slices.Reverse(rows)
 		return statsRowsMsg{rows, err, revision}
 	}
@@ -985,11 +986,15 @@ func (m *Model) statsMessages(w, h int) string {
 		distance := fadeDistance(active, i)
 		hover := i == active
 		metaColor := components.Accent
-		if r.Status == "missing" {
+		if unavailableStatus(r.Status) {
 			metaColor = components.Deleted
 		}
+		contentColor := components.Text
+		if r.SendEvent && !r.MessageRecord {
+			contentColor = components.Muted
+		}
 		metaStyle := lipgloss.NewStyle().Foreground(components.Fade(metaColor, distance))
-		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(components.Text, distance))
+		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(contentColor, distance))
 		mutedColor := components.Fade(components.Muted, distance)
 		rowStyle := lipgloss.NewStyle().Padding(0, 1).Width(cw - 2)
 		if hover {

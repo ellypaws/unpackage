@@ -3,6 +3,7 @@ package store
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"maps"
@@ -14,15 +15,30 @@ import (
 )
 
 type Store struct {
-	mu        sync.RWMutex
-	snapshots [2]*Snapshot
-	messages  [2]map[string]Message
-	channels  [2]map[string]channel
-	byDate    [2]map[string][]string
-	events    [2]map[string]Event
-	sent      [2]map[string]SentMessage
-	names     [2]map[string]string
-	interned  map[string]string
+	mu              sync.RWMutex
+	snapshots       [2]*Snapshot
+	messages        [2]map[string]Message
+	channels        [2]map[string]channel
+	byDate          [2]map[string][]string
+	events          [2]map[string]Event
+	sent            [2]map[string]SentMessage
+	names           [2]map[string]string
+	interned        map[string]string
+	rowCacheMu      sync.Mutex
+	rowCache        map[string]rowCacheEntry
+	rowCacheBytes   int64
+	rowCacheVersion uint64
+}
+
+const (
+	rowCacheLimit = 256 << 20
+	rowCacheTTL   = 5 * time.Minute
+)
+
+type rowCacheEntry struct {
+	rows                []Row
+	size                int64
+	expiresAt, accessed time.Time
 }
 
 type EventKind uint8
@@ -113,6 +129,7 @@ type Filter struct {
 	From, Until                        string
 	Limit, Offset                      int
 	DateBefore, DateAfter              int
+	HideEventOnly                      bool
 }
 type Snapshot struct {
 	Slot                      int
@@ -136,6 +153,15 @@ type serverLabel struct {
 }
 
 func New() *Store { return &Store{} }
+
+func (s *Store) invalidateRows() {
+	s.rowCacheMu.Lock()
+	s.rowCacheVersion++
+	s.rowCache = nil
+	s.rowCacheBytes = 0
+	s.rowCacheMu.Unlock()
+}
+
 func (s *Store) Clear(slot int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,6 +172,7 @@ func (s *Store) Clear(slot int) {
 	s.events[slot] = nil
 	s.sent[slot] = nil
 	s.names[slot] = nil
+	s.invalidateRows()
 }
 func (s *Store) Reset(ctx context.Context, slot int) error {
 	if e := ctx.Err(); e != nil {
@@ -163,6 +190,7 @@ func (s *Store) Reset(ctx context.Context, slot int) error {
 	s.events[slot] = map[string]Event{}
 	s.sent[slot] = map[string]SentMessage{}
 	s.names[slot] = map[string]string{}
+	s.invalidateRows()
 	return nil
 }
 
@@ -182,6 +210,7 @@ func (s *Store) Names(ctx context.Context, slot int, names map[string]string) er
 		}
 		s.names[slot][id] = name
 	}
+	s.invalidateRows()
 	return nil
 }
 
@@ -351,6 +380,7 @@ func (s *Store) SentMessages(ctx context.Context, slot int, messages []SentMessa
 	if snapshot := s.snapshots[slot]; snapshot != nil {
 		snapshot.Count = int64(s.messageCountLocked(slot))
 	}
+	s.invalidateRows()
 	return nil
 }
 
@@ -370,9 +400,13 @@ func (s *Store) intern(v string) string {
 func (s *Store) SetSnapshot(slot int, v Snapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := s.snapshots[slot]
 	v.Slot = slot
 	v.Count = int64(s.messageCountLocked(slot))
 	s.snapshots[slot] = &v
+	if previous == nil || previous.Owner != v.Owner || previous.State != v.State || previous.Path != v.Path || previous.Complete != v.Complete {
+		s.invalidateRows()
+	}
 }
 
 func (s *Store) messageCountLocked(slot int) int {
@@ -406,6 +440,7 @@ func (s *Store) Add(ctx context.Context, slot int, ms []Message) error {
 		}
 	}
 	s.snapshots[slot].Count = int64(s.messageCountLocked(slot))
+	s.invalidateRows()
 	return nil
 }
 func merge(a, b channel) channel {
@@ -532,6 +567,7 @@ func (s *Store) Channels(ctx context.Context, slot int, observations []ChannelOb
 		}
 		s.channels[slot][observation.ID] = merge(s.channels[slot][observation.ID], channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank))
 	}
+	s.invalidateRows()
 	return nil
 }
 func (s *Store) Snapshots(ctx context.Context) ([]Snapshot, error) {
@@ -632,9 +668,106 @@ func (s *Store) skipCombinedMessage(slot int, id string) bool {
 	return oldRecord && !newRecord && oldObserved
 }
 
+func rowFilterKey(f Filter) string {
+	f.Limit = 0
+	f.Offset = 0
+	encoded, _ := json.Marshal(f)
+	return string(encoded)
+}
+
+func (s *Store) cachedRows(key string, now time.Time) ([]Row, uint64, bool) {
+	s.rowCacheMu.Lock()
+	defer s.rowCacheMu.Unlock()
+	version := s.rowCacheVersion
+	entry, ok := s.rowCache[key]
+	if !ok {
+		return nil, version, false
+	}
+	if !now.Before(entry.expiresAt) {
+		delete(s.rowCache, key)
+		s.rowCacheBytes -= entry.size
+		return nil, version, false
+	}
+	entry.accessed = now
+	s.rowCache[key] = entry
+	return entry.rows, version, true
+}
+
+func cachedRowsSize(key string, rows []Row) int64 {
+	size := int64(len(key))
+	for _, row := range rows {
+		size += 288 + int64(len(row.ID)+len(row.Channel)+len(row.Date)+len(row.Content)+len(row.Guild)+len(row.Server)+len(row.Name)+len(row.Kind)+len(row.Status)+len(row.SendEventID)+len(row.SendTime)+len(row.Platform))
+		for _, value := range row.AttachmentURLs {
+			size += 16 + int64(len(value))
+		}
+		for _, value := range row.Sources {
+			size += 16 + int64(len(value))
+		}
+	}
+	return size
+}
+
+func (s *Store) cacheRows(key string, version uint64, rows []Row, now time.Time) {
+	size := cachedRowsSize(key, rows)
+	if size > rowCacheLimit {
+		return
+	}
+	s.rowCacheMu.Lock()
+	defer s.rowCacheMu.Unlock()
+	if version != s.rowCacheVersion {
+		return
+	}
+	if s.rowCache == nil {
+		s.rowCache = map[string]rowCacheEntry{}
+	}
+	if previous, ok := s.rowCache[key]; ok {
+		s.rowCacheBytes -= previous.size
+		delete(s.rowCache, key)
+	}
+	for cacheKey, entry := range s.rowCache {
+		if !now.Before(entry.expiresAt) {
+			s.rowCacheBytes -= entry.size
+			delete(s.rowCache, cacheKey)
+		}
+	}
+	for s.rowCacheBytes+size > rowCacheLimit {
+		oldestKey := ""
+		var oldest time.Time
+		for cacheKey, entry := range s.rowCache {
+			if oldestKey == "" || entry.accessed.Before(oldest) {
+				oldestKey = cacheKey
+				oldest = entry.accessed
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		s.rowCacheBytes -= s.rowCache[oldestKey].size
+		delete(s.rowCache, oldestKey)
+	}
+	s.rowCache[key] = rowCacheEntry{rows: rows, size: size, expiresAt: now.Add(rowCacheTTL), accessed: now}
+	s.rowCacheBytes += size
+}
+
+func pageRows(rows []Row, offset, limit int) []Row {
+	if limit <= 0 {
+		return rows
+	}
+	start := min(max(0, offset), len(rows))
+	return slices.Clone(rows[start:min(len(rows), start+limit)])
+}
+
 func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	if e := ctx.Err(); e != nil {
 		return nil, e
+	}
+	offset, limit := f.Offset, f.Limit
+	f.Offset, f.Limit = 0, 0
+	cacheKey := rowFilterKey(f)
+	now := time.Now()
+	cached, cacheVersion, ok := s.cachedRows(cacheKey, now)
+	if ok {
+		return pageRows(cached, offset, limit), nil
 	}
 	if f.DateBefore < 0 || f.DateAfter < 0 || f.DateBefore > 3650 || f.DateAfter > 3650 {
 		return nil, fmt.Errorf("date margin must be between 0 and 3650 days")
@@ -747,6 +880,9 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			if mode == "missing" && inNewRecord || mode == "present" && (!inOldRecord || !inNewRecord) || mode == "new" && inOld || mode == "all" && same && s.skipCombinedMessage(slot, m.ID) {
 				continue
 			}
+			if f.HideEventOnly && !observed.MessageRecord && !(same && (inOldRecord || inNewRecord)) {
+				continue
+			}
 			sent := observed.Sent
 			if same {
 				sent = mergeSentMessage(sent, s.sent[1-slot][m.ID])
@@ -822,11 +958,8 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	slices.SortFunc(rows, func(a, b Row) int {
 		return cmp.Or(strings.Compare(a.Date, b.Date), cmp.Compare(len(a.ID), len(b.ID)), strings.Compare(a.ID, b.ID))
 	})
-	if f.Limit > 0 {
-		start := min(max(0, f.Offset), len(rows))
-		rows = rows[start:min(len(rows), start+f.Limit)]
-	}
-	return rows, nil
+	s.cacheRows(cacheKey, cacheVersion, rows, now)
+	return pageRows(rows, offset, limit), nil
 }
 func (s *Store) Each(ctx context.Context, f Filter, fn func(Row) error) error {
 	rows, e := s.Rows(ctx, f)

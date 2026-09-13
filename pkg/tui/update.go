@@ -23,6 +23,16 @@ import (
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case scrollMsg:
+		if v.Revision != m.ScrollRevision || !m.ScrollPending {
+			return m, nil
+		}
+		m.ScrollPending = false
+		if m.Tab != tabInvestigate || m.Detail != nil || m.ServerDialog {
+			return m, nil
+		}
+		m.Offset = m.PendingOffset
+		return m, m.restartRefresh()
 	case searchMsg:
 		if v.Server {
 			if v.Revision != m.ServerRevision || v.Value != m.ServerInput.Value() {
@@ -125,10 +135,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	case dataMsg:
+		if v.Query != m.QueryRevision {
+			return m, nil
+		}
 		m.Loading = false
+		if m.refreshCancel != nil {
+			m.refreshCancel()
+			m.refreshCancel = nil
+		}
 		if v.Revision != m.Revision {
 			return m, m.refresh()
 		}
+		m.updateImportRates(v.Snapshots, time.Now())
 		m.Rows = v.Rows
 		m.Groups = v.Groups
 		if m.ServerDialog {
@@ -310,8 +328,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 			if m.Tab == tabInvestigate && !m.ServerDialog {
-				m.Offset = max(0, min(max(0, m.ScrollTotal-m.ScrollVisible), m.Offset+delta*3))
-				return m, m.refresh()
+				return m, m.queueScroll(delta)
 			}
 			if m.Tab == tabStats && !m.ServerDialog {
 				m.statsScroll(delta)
@@ -748,7 +765,7 @@ func (m *Model) action(id string) tea.Cmd {
 		m.Offset = min(m.ScrollTotal-m.ScrollVisible, max(0, position*(m.ScrollTotal-m.ScrollVisible)/max(1, m.ScrollHeight-1)))
 		m.Cursor = 0
 		m.Focus = "row-0"
-		return m.refresh()
+		return m.restartRefresh()
 	}
 	if g, ok := strings.CutPrefix(id, "server-"); ok {
 		included, excluded := m.targetGuilds()
@@ -859,12 +876,12 @@ func (m *Model) action(id string) tea.Cmd {
 		return m.run("clear")
 	case "previous":
 		m.Offset = max(0, m.Offset-m.pageSize())
-		return m.refresh()
+		return m.restartRefresh()
 	case "next":
 		if len(m.Rows) == m.pageSize() {
 			m.Offset += len(m.Rows)
 		}
-		return m.refresh()
+		return m.restartRefresh()
 	case "scope":
 		if m.RequestScope == "all" {
 			m.RequestScope = "filtered"
@@ -937,6 +954,9 @@ func (m *Model) action(id string) tea.Cmd {
 	case "channel-clear":
 		m.Session.Filter.Channel = ""
 		m.ChannelLabel = ""
+		return m.changed()
+	case "hide-event-only":
+		m.Session.Filter.HideEventOnly = !m.Session.Filter.HideEventOnly
 		return m.changed()
 	case "days-input", "search-input", "request-path", "margin-before", "margin-after", "servers-input":
 		m.Focus = id

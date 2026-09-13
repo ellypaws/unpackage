@@ -26,6 +26,30 @@ func (m *Model) button(id, label string, active bool) string {
 	m.Actions = append(m.Actions, id)
 	return components.Button(m.Zones, id, label, m.Hover, m.Focus, active)
 }
+
+func (m *Model) checkbox(id, label string, checked bool) string {
+	mark := "[ ]"
+	if checked {
+		mark = "[x]"
+	}
+	if !m.enabled(id) {
+		return lipgloss.NewStyle().Foreground(components.Border).Render(mark + " " + label)
+	}
+	style := lipgloss.NewStyle().Foreground(components.Text)
+	if checked {
+		style = style.Foreground(components.Accent).Bold(true)
+	}
+	if m.Hover == id || m.Focus == id {
+		style = style.Foreground(lipgloss.Color("#FFFFFF")).Background(components.SurfaceHover).Underline(true).Bold(true)
+	}
+	m.Actions = append(m.Actions, id)
+	return m.Zones.Mark(id, style.Render(mark+" "+label))
+}
+
+func unavailableStatus(status string) bool {
+	return status == "missing" || status == "send event only"
+}
+
 func (m *Model) bodyHeight() int {
 	if m.Tab == tabConsole {
 		return max(3, m.Height-12)
@@ -75,6 +99,9 @@ func (m *Model) workLabel() string {
 	if m.IncidentProcessing != "" {
 		return m.IncidentProcessing
 	}
+	if m.ScrollPending {
+		return "Scrolling…"
+	}
 	if m.ServerDialog && m.ServerInput.Value() != m.ServerSearch {
 		return "Searching servers…"
 	}
@@ -85,7 +112,7 @@ func (m *Model) workLabel() string {
 		return "Searching messages…"
 	}
 	if m.Session.Busy() {
-		return "Importing packages…"
+		return m.importWorkLabel()
 	}
 	if m.Tab == tabStats && m.StatsLoading {
 		return "Computing statistics…"
@@ -106,6 +133,70 @@ func (m *Model) workLabel() string {
 		return "Refreshing results…"
 	}
 	return ""
+}
+
+func formatByteRate(value float64) string {
+	units := []string{"B/s", "KB/s", "MB/s", "GB/s"}
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 || value >= 100 {
+		return fmt.Sprintf("%.0f %s", value, units[unit])
+	}
+	return fmt.Sprintf("%.1f %s", value, units[unit])
+}
+
+func formatRemaining(seconds float64) string {
+	total := int64(seconds + 0.5)
+	if total < 60 {
+		return fmt.Sprintf("%ds", max(int64(1), total))
+	}
+	if total < 3600 {
+		return fmt.Sprintf("%dm %ds", total/60, total%60)
+	}
+	return fmt.Sprintf("%dh %dm", total/3600, total%3600/60)
+}
+
+func (m *Model) importWorkLabel() string {
+	loading := 0
+	bytesPerSecond := 0.0
+	messagesPerSecond := 0.0
+	remaining := 0.0
+	for _, snapshot := range m.Snapshots {
+		if snapshot.State != "loading" {
+			continue
+		}
+		loading++
+		rate := m.ImportRates[snapshot.Slot]
+		if rate.Samples < 2 {
+			continue
+		}
+		bytesPerSecond += rate.BytesPerSecond
+		messagesPerSecond += rate.PerSecond
+		if snapshot.Total > snapshot.Bytes && rate.BytesPerSecond > 0 {
+			remaining = max(remaining, float64(snapshot.Total-snapshot.Bytes)/rate.BytesPerSecond)
+		}
+	}
+	label := "Importing package"
+	if loading != 1 {
+		label = "Importing packages"
+	}
+	var details []string
+	if bytesPerSecond >= 1 {
+		details = append(details, formatByteRate(bytesPerSecond))
+	}
+	if messagesPerSecond >= 1 {
+		details = append(details, number(int(messagesPerSecond))+" messages/s")
+	}
+	if remaining >= 1 {
+		details = append(details, formatRemaining(remaining)+" remaining")
+	}
+	if len(details) == 0 {
+		return label + "…"
+	}
+	return label + ": " + strings.Join(details, ", ")
 }
 
 func (m *Model) statusLine(width int) string {
@@ -212,7 +303,7 @@ func (m *Model) View() string {
 		m.Viewport.Width = w - 4
 		m.Viewport.Height = h - 3
 		titleStyle := components.Title
-		if r.Status == "missing" {
+		if unavailableStatus(r.Status) {
 			titleStyle = titleStyle.Foreground(components.Deleted)
 		}
 		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text))
@@ -545,6 +636,8 @@ func (m *Model) filters(w int) string {
 	parts = append(parts, m.button("margin", components.Fit(margin, w-3), f.DateBefore > 0 || f.DateAfter > 0))
 	media := optionLabel(mediaOptions, f.Media)
 	parts = append(parts, m.dropdown("media", components.Fit(media, w-5), f.Media != ""))
+	m.Tips["hide-event-only"] = "Hide messages absent from both Messages exports and recovered only from send_message analytics."
+	parts = append(parts, m.checkbox("hide-event-only", "Hide send-event-only messages", f.HideEventOnly))
 	servers := serverSelectionLabel(f.Guilds, f.ExcludedGuilds)
 	parts = append(parts, m.button("servers", servers, len(f.Guilds) > 0 || len(f.ExcludedGuilds) > 0)+" "+m.button("clear", "Reset", false))
 	if f.Channel != "" {
@@ -589,9 +682,19 @@ func (m *Model) results(w, h int) string {
 	if total == 1 {
 		label = strings.TrimSuffix(label, "s")
 	}
-	resultTitle := components.Title.Render(number(total) + " " + label)
+	titleText := number(total) + " " + label
+	if total > 0 {
+		offset := m.Offset
+		if m.ScrollPending {
+			offset = m.PendingOffset
+		}
+		start := min(total, offset) + 1
+		end := min(total, offset+m.pageSize())
+		titleText += ", " + number(start) + " to " + number(end)
+	}
+	resultTitle := components.Title.Render(titleText)
 	if m.Loading {
-		resultTitle = components.Shimmer(number(total)+" "+label, m.Frame)
+		resultTitle = components.Shimmer(titleText, m.Frame)
 	}
 	header := resultTitle + "  " + m.dropdown("mode", optionLabel(modeOptions, m.Session.Filter.Mode), false) + " " + m.button("previous", "‹", false) + " " + m.button("next", "›", false)
 	if m.PackagesExpanded {
@@ -687,11 +790,15 @@ func (m *Model) messages(w, h int) string {
 		}
 		hover := active == i
 		metaColor := components.Accent
-		if r.Status == "missing" {
+		if unavailableStatus(r.Status) {
 			metaColor = components.Deleted
 		}
+		contentColor := components.Text
+		if r.SendEvent && !r.MessageRecord {
+			contentColor = components.Muted
+		}
 		metaStyle := lipgloss.NewStyle().Foreground(components.Fade(metaColor, distance))
-		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(components.Text, distance))
+		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(contentColor, distance))
 		mutedColor := components.Fade(components.Muted, distance)
 		rowStyle := lipgloss.NewStyle().Padding(0, 1).Width(listWidth - 2)
 		if hover {

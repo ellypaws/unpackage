@@ -23,6 +23,7 @@ import (
 )
 
 type tickMsg time.Time
+type scrollMsg struct{ Revision int }
 type searchMsg struct {
 	Server   bool
 	Revision int
@@ -50,8 +51,17 @@ type dataMsg struct {
 	Snapshots             []store.Snapshot
 	Warning               string
 	Err                   error
-	Revision              int
+	Revision, Query       int
 }
+
+type importRate struct {
+	Path                      string
+	At                        time.Time
+	Bytes, Count              int64
+	BytesPerSecond, PerSecond float64
+	Samples                   int
+}
+
 type resultMsg struct {
 	Text string
 	Err  error
@@ -71,6 +81,8 @@ type Model struct {
 	ctx                                           context.Context
 	Zones                                         *zone.Manager
 	Width, Height, Tab, Cursor, Offset, Revision  int
+	PendingOffset, ScrollRevision                 int
+	ScrollPending                                 bool
 	Frame                                         int
 	Input                                         textinput.Model
 	ServerInput                                   textinput.Model
@@ -136,6 +148,9 @@ type Model struct {
 	StatsRows                                     []store.Row
 	StatsRowsRevision                             int
 	StatsRowsLoading                              bool
+	QueryRevision                                 int
+	refreshCancel                                 context.CancelFunc
+	ImportRates                                   [2]importRate
 	ChannelLabel                                  string
 	HeatCursor                                    [2]int
 	Tips                                          map[string]string
@@ -208,10 +223,11 @@ func tick(active bool) tea.Cmd {
 	return tea.Tick(interval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 func (m *Model) refresh() tea.Cmd {
-	if m.Loading || m.Executing {
+	if m.Loading || m.Executing || m.ScrollPending {
 		return nil
 	}
 	m.Loading = true
+	m.QueryRevision++
 	f := m.Session.Filter
 	f.Guilds = slices.Clone(f.Guilds)
 	f.ExcludedGuilds = slices.Clone(f.ExcludedGuilds)
@@ -220,10 +236,12 @@ func (m *Model) refresh() tea.Cmd {
 	f.Limit = m.pageSize()
 	f.Offset = m.Offset
 	revision := m.Revision
+	query := m.QueryRevision
 	s := m.Session.Store
-	ctx := m.ctx
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.refreshCancel = cancel
 	return func() tea.Msg {
-		d := dataMsg{Revision: revision}
+		d := dataMsg{Revision: revision, Query: query}
 		d.Snapshots, d.Err = s.Snapshots(ctx)
 		if d.Err != nil {
 			return d
@@ -257,7 +275,7 @@ func (m *Model) refresh() tea.Cmd {
 		if f.Limit > 0 {
 			end = min(end, start+f.Limit)
 		}
-		d.Rows = filtered[start:end]
+		d.Rows = slices.Clone(filtered[start:end])
 		d.Groups = store.GroupRows(filtered, false)
 		d.Days = store.GroupRows(filtered, true)
 		matchingGroups := store.GroupRows(matching, false)
@@ -279,7 +297,92 @@ func (m *Model) refresh() tea.Cmd {
 		return d
 	}
 }
-func (m *Model) changed() tea.Cmd { m.Revision++; m.Cursor = 0; m.Offset = 0; return m.refresh() }
+
+func (m *Model) restartRefresh() tea.Cmd {
+	if m.ScrollPending {
+		m.ScrollRevision++
+		m.ScrollPending = false
+	}
+	m.interruptRefresh()
+	return m.refresh()
+}
+
+func (m *Model) interruptRefresh() {
+	if m.refreshCancel != nil {
+		m.refreshCancel()
+		m.refreshCancel = nil
+	}
+	if m.Loading {
+		m.QueryRevision++
+	}
+	m.Loading = false
+}
+
+func (m *Model) queueScroll(delta int) tea.Cmd {
+	target := m.Offset
+	if m.ScrollPending {
+		target = m.PendingOffset
+	}
+	next := max(0, min(max(0, m.ScrollTotal-m.ScrollVisible), target+delta*3))
+	if next == target && !m.ScrollPending {
+		return nil
+	}
+	m.PendingOffset = next
+	m.ScrollPending = true
+	m.ScrollRevision++
+	revision := m.ScrollRevision
+	m.interruptRefresh()
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return scrollMsg{Revision: revision} })
+}
+
+func (m *Model) changed() tea.Cmd {
+	m.Revision++
+	m.Cursor = 0
+	m.Offset = 0
+	return m.restartRefresh()
+}
+
+func (m *Model) updateImportRates(snapshots []store.Snapshot, now time.Time) {
+	active := [2]bool{}
+	for _, snapshot := range snapshots {
+		if snapshot.Slot < 0 || snapshot.Slot >= len(m.ImportRates) || snapshot.State != "loading" {
+			continue
+		}
+		active[snapshot.Slot] = true
+		rate := &m.ImportRates[snapshot.Slot]
+		if rate.Path != snapshot.Path || snapshot.Bytes < rate.Bytes || snapshot.Count < rate.Count {
+			*rate = importRate{Path: snapshot.Path, At: now, Bytes: snapshot.Bytes, Count: snapshot.Count}
+			continue
+		}
+		elapsed := now.Sub(rate.At).Seconds()
+		if elapsed < 0.1 {
+			continue
+		}
+		bytesPerSecond := float64(snapshot.Bytes-rate.Bytes) / elapsed
+		perSecond := float64(snapshot.Count-rate.Count) / elapsed
+		if bytesPerSecond > 0 || perSecond > 0 {
+			rate.Samples++
+		}
+		if rate.BytesPerSecond == 0 {
+			rate.BytesPerSecond = bytesPerSecond
+		} else if bytesPerSecond > 0 {
+			rate.BytesPerSecond = rate.BytesPerSecond*0.7 + bytesPerSecond*0.3
+		}
+		if rate.PerSecond == 0 {
+			rate.PerSecond = perSecond
+		} else if perSecond > 0 {
+			rate.PerSecond = rate.PerSecond*0.7 + perSecond*0.3
+		}
+		rate.At = now
+		rate.Bytes = snapshot.Bytes
+		rate.Count = snapshot.Count
+	}
+	for slot := range m.ImportRates {
+		if !active[slot] {
+			m.ImportRates[slot] = importRate{}
+		}
+	}
+}
 
 func mergeServerOrder(current, next []store.Group) []store.Group {
 	byID := make(map[string]store.Group, len(next))
