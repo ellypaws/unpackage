@@ -36,7 +36,11 @@ dates clear                Clear selected days
 margin BEFORE AFTER        Include days around each selected date
 last N                     Last N days, including today
 before YYYY-MM-DD          Before creation date
-search "text"              Search message contents
+search QUERY               Search messages with text and filters
+  from:PERSON in:CHANNEL server:SERVER mentions:USER
+  has:image|video|sound|link|file|embed|poll|sticker|forward
+  type:dm|group|server|unknown before:DATE after:DATE on:DATE
+  regex:"(?i)pattern" id:MESSAGE_ID, -filter:value excludes
 channel ID                 Filter one channel
 kind guild|dm|group|unknown-dm|unknown|conflict|all
 media all|attachments|media
@@ -230,6 +234,9 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		s.Filter.From = ""
 		s.Filter.Until = arg
 	case "search":
+		if _, err := store.ParseSearch(arg); err != nil {
+			return err
+		}
 		s.Filter.Search = arg
 		s.Filter.Offset = 0
 	case "channel":

@@ -136,6 +136,37 @@ Use `summary`, `leaders servers missing`, or `heatmap voice-time all` for statis
 Use `show MESSAGE_ID` for a complete row. Use `list jsonl` or `list tsv` to export the current
 results. Use `clear` to reset filters and `stop` to stop an import while keeping data already read.
 
+Search accepts plain words, quoted phrases, and filters:
+
+```text
+from:Alice type:dm has:image
+server:"Sample Garden" in:general after:2024-01-01
+mentions:100000000000000002 -has:link
+regex:"(?i)invoice\s+[0-9]+"
+```
+
+`from:` includes the package owner and known conversation participants. Exports contain your
+sent messages, so choosing a participant finds your messages in those conversations. `type:dm`,
+`type:group`, and `type:server` narrow that scope. Names and IDs work for people, servers, and
+channels. Channel suggestions follow the selected server; invalid values appear in red.
+
+`has:` offers image, video, sound, link, file, embed, poll, sticker, and forward. The last four
+match only metadata actually included in the export. `before:`, `after:`, and `on:` take local
+calendar dates in YYYY-MM-DD form. `id:` finds an exact message ID. Repeated values of the same
+filter form a set, distinct filters intersect, and a leading `-` excludes a value. Regex uses Go's
+regular-expression syntax, including `(?i)` for case-insensitive matching.
+
+Search suggestions show recent conversation dates and syntax guidance. Arrow keys choose a
+suggestion; Tab or Enter accepts it. Filter tokens can be edited or removed. The Console tab and
+interactive REPL also offer gray suggestions and Tab completion, with Up and Down for history.
+
+Imports read account identity and message files before channel metadata and Activity. Activity
+waits for both open packages' message scans, then loads automatically. Comparisons become available
+as soon as both message scans finish. Stats shows the available partial totals on first opening,
+refreshes every 10 seconds during import, and refreshes again when import finishes. Changing a
+stats filter refreshes immediately. Voice and game totals appear as Activity records arrive;
+missing-message counts wait for both message scans to finish.
+
 ## Create a deletion-request draft
 
 Include or exclude one or more server IDs, then choose the scope of the draft:

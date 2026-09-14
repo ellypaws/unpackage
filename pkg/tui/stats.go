@@ -17,9 +17,10 @@ import (
 )
 
 type statsMsg struct {
-	Stats    *store.Stats
-	Err      error
-	Revision int
+	Stats          *store.Stats
+	Err            error
+	Revision       int
+	FilterRevision int
 }
 
 type statsRowsMsg struct {
@@ -51,6 +52,7 @@ var (
 )
 
 const overviewRows = 5
+const statsImportInterval = 10 * time.Second
 
 func optionLabel(options []option, key string) string {
 	for _, o := range options {
@@ -86,18 +88,21 @@ func (m *Model) refreshStats() tea.Cmd {
 		return nil
 	}
 	m.StatsLoading = true
+	m.StatsAt = time.Now()
 	revision := m.StatsRevision
+	filterRevision := m.StatsFilterRevision
 	f := m.statsFilter()
 	s := m.Session.Store
 	ctx := m.ctx
 	return func() tea.Msg {
 		st, err := s.Stats(ctx, f)
-		return statsMsg{st, err, revision}
+		return statsMsg{Stats: st, Err: err, Revision: revision, FilterRevision: filterRevision}
 	}
 }
 
 func (m *Model) ensureStats() tea.Cmd {
-	if m.statsStale() {
+	importing := m.Session.Busy() || slices.ContainsFunc(m.Snapshots, func(s store.Snapshot) bool { return s.State == "loading" })
+	if m.statsStale() && (m.StatsAt.IsZero() || !importing || time.Since(m.StatsAt) >= statsImportInterval) {
 		return m.refreshStats()
 	}
 	return nil
@@ -105,6 +110,7 @@ func (m *Model) ensureStats() tea.Cmd {
 
 func (m *Model) statsChanged() tea.Cmd {
 	m.StatsRevision++
+	m.StatsFilterRevision++
 	m.StatsOffset = 0
 	m.StatsCursor = 0
 	return m.refreshStats()
@@ -533,7 +539,7 @@ func (m *Model) stats(w, h int) string {
 	remaining := h - lipgloss.Height(strings.Join(parts, "\n")) - 1
 	if m.Stats == nil {
 		if len(m.Snapshots) == 0 {
-			parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Width(w).Render("Add a package to see statistics. Voice, game and session figures come from the Activity folder and appear once it finishes loading."))
+			parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Width(w).Render("Add a package to see statistics. Voice, game and session figures appear as Activity records are imported."))
 		} else {
 			parts = append(parts, components.Working("Computing statistics…", m.Frame, w))
 		}
@@ -559,7 +565,7 @@ func (m *Model) stats(w, h int) string {
 func (m *Model) importNote() string {
 	for _, s := range m.Snapshots {
 		if s.State == "loading" {
-			return lipgloss.NewStyle().Foreground(components.Muted).Render("Import in progress. Voice, game and session figures are read last.")
+			return lipgloss.NewStyle().Foreground(components.Muted).Render("Partial totals. Refreshing every 10 seconds during import.")
 		}
 	}
 	return ""

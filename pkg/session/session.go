@@ -132,6 +132,9 @@ func RangeWindow(days int, today time.Time) (time.Time, time.Time) {
 }
 
 func Split(line string) ([]string, error) {
+	if query, ok := strings.CutPrefix(strings.TrimSpace(line), "search"); ok && len(query) > 0 && (query[0] == ' ' || query[0] == '\t') {
+		return []string{"search", strings.TrimSpace(query)}, nil
+	}
 	var out []string
 	var b strings.Builder
 	var quote rune

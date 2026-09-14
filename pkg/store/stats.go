@@ -299,9 +299,22 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 		return nil, e
 	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	view := &Store{}
+	for slot := range 2 {
+		if snapshot := s.snapshots[slot]; snapshot != nil {
+			view.snapshots[slot] = new(*snapshot)
+		}
+		view.messages[slot] = maps.Clone(s.messages[slot])
+		view.sent[slot] = maps.Clone(s.sent[slot])
+		view.events[slot] = maps.Clone(s.events[slot])
+		view.channels[slot] = maps.Clone(s.channels[slot])
+		view.names[slot] = maps.Clone(s.names[slot])
+	}
+	s.mu.RUnlock()
+	s = view
 	a, b := s.snapshots[0], s.snapshots[1]
 	same := sameOwner(a, b)
+	comparable, _ := compatible(a, b)
 	channels := make(map[string]channel, len(s.channels[0])+len(s.channels[1]))
 	for slot, cs := range s.channels {
 		if !same && (a != nil && slot != 0 || a == nil && slot != 1) {
@@ -414,11 +427,15 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 				continue
 			}
 			_, inNewRecord := s.messages[1][m.ID]
-			missing := same && slot == 0 && !inNewRecord
+			missing := comparable && slot == 0 && !inNewRecord
 			if st.FirstMessage.IsZero() || t.Before(st.FirstMessage) {
 				st.FirstMessage = t
 			}
-			words := max(len(strings.Fields(m.Content)), sent.Words)
+			words := 0
+			for range strings.FieldsSeq(m.Content) {
+				words++
+			}
+			words = max(words, sent.Words)
 			links := sent.URLs > 0 || strings.Contains(m.Content, "http://") || strings.Contains(m.Content, "https://")
 			st.Characters += max(len(m.Content), sent.Length)
 			st.add(MetricMessages, t, 1)

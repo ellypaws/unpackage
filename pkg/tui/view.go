@@ -89,7 +89,7 @@ func (m *Model) modal(title, body string) string {
 	}
 	width := min(m.Width-2, max(lipgloss.Width(body)+6, lipgloss.Width(title)+7))
 	panel := components.TitledBox(title, body, width, 2, lipgloss.RoundedBorder(), border, "", m.Frame, m.workLabel() != "")
-	return m.Zones.Scan(m.overlayMenu(lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, panel)))
+	return m.Zones.Scan(m.overlaySearch(m.overlayMenu(lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center, panel))))
 }
 
 func (m *Model) workLabel() string {
@@ -99,7 +99,7 @@ func (m *Model) workLabel() string {
 	if m.IncidentProcessing != "" {
 		return m.IncidentProcessing
 	}
-	if m.ScrollPending {
+	if m.ScrollPending && !m.ScrollCached {
 		return "Scrolling…"
 	}
 	if m.ServerDialog && m.ServerInput.Value() != m.ServerSearch {
@@ -384,7 +384,7 @@ func (m *Model) View() string {
 	if m.Tab == tabConsole {
 		footer = m.field("command", &m.Input, w) + "\n" + footer
 	}
-	frame := m.Zones.Scan(m.overlayMenu(lipgloss.NewStyle().Padding(1, 2).Render(m.appTitle(w) + "\n" + tabRow + "\n\n" + lipgloss.NewStyle().Height(h).MaxHeight(h).Width(w).Render(body) + "\n" + footer)))
+	frame := m.Zones.Scan(m.overlaySearch(m.overlayMenu(lipgloss.NewStyle().Padding(1, 2).Render(m.appTitle(w) + "\n" + tabRow + "\n\n" + lipgloss.NewStyle().Height(h).MaxHeight(h).Width(w).Render(body) + "\n" + footer))))
 	if m.Menu != nil {
 		return frame
 	}
@@ -596,7 +596,11 @@ func (m *Model) investigate(w, h int) string {
 	return box.Render()
 }
 func (m *Model) filters(w int) string {
-	parts := []string{m.field("search-input", &m.SearchInput, min(36, w)), components.Title.Render("Message dates"), m.button("clipboard", "Paste from clipboard", false), m.field("days-input", &m.DayInput, min(34, w))}
+	parts := []string{m.field("search-input", &m.SearchInput, min(36, w))}
+	if tokens := m.searchTokens(w); tokens != "" {
+		parts = append(parts, tokens)
+	}
+	parts = append(parts, components.Title.Render("Message dates"), m.button("clipboard", "Paste from clipboard", false), m.field("days-input", &m.DayInput, min(34, w)))
 	parts = append(parts, m.button("dates", "Choose dates", false)+" "+m.button("dates-clear", "Clear", false))
 	parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Separate multiple dates with ;"))
 	dates := m.Session.Filter.Dates
@@ -671,6 +675,9 @@ func (m *Model) results(w, h int) string {
 		}
 		control := m.button("filters", label, false)
 		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Center, m.field("search-input", &m.SearchInput, min(36, w-lipgloss.Width(control)-2)), "  ", control))
+		if tokens := m.searchTokens(w); tokens != "" {
+			parts = append(parts, tokens)
+		}
 	} else {
 		parts = append(parts, "")
 	}

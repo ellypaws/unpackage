@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"os/signal"
@@ -53,14 +54,27 @@ func run() error {
 		}
 		scan := bufio.NewScanner(os.Stdin)
 		scan.Buffer(make([]byte, 4096), 65536)
+		var history []string
 		for {
+			var line string
 			if interactive {
-				fmt.Fprint(os.Stderr, "› ")
+				line, e = tui.ReadCommand(ctx, s, history)
+				if e == io.EOF {
+					return nil
+				}
+				if e != nil {
+					return e
+				}
+				if line != "" {
+					history = append(history, line)
+				}
+			} else {
+				if !scan.Scan() {
+					break
+				}
+				line = scan.Text()
 			}
-			if !scan.Scan() {
-				break
-			}
-			args, e := session.Split(scan.Text())
+			args, e := session.Split(line)
 			if e != nil {
 				fmt.Fprintln(os.Stderr, e)
 				continue

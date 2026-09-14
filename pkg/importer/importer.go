@@ -314,7 +314,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					if kind == "" {
 						kind = "unknown"
 					}
-					observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Rank: 3}
+					observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Recipients: m["recipients"], Rank: 3}
 					if kind == "group" {
 						observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: 3}
 					}
@@ -335,7 +335,13 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				hasAttachments := m["has_attachments"] == "1" || attachmentPresent(m["attachments"])
 				hasMedia := m["has_media"] == "1" || attachmentMedia(m["attachments"])
 				attachmentURLs := attachmentURLs(m["attachments"], m[attachmentURLsKey])
-				messages = append(messages, store.Message{ID: id, Channel: f.channel, Date: store.Day(id), Content: body, AttachmentURLs: attachmentURLs, HasAttachments: hasAttachments, HasMedia: hasMedia})
+				var features []string
+				for _, kind := range store.SearchHas {
+					if m["has_"+kind] == "1" {
+						features = append(features, kind)
+					}
+				}
+				messages = append(messages, store.Message{ID: id, Channel: f.channel, Date: store.Day(id), Content: body, Features: features, AttachmentURLs: attachmentURLs, HasAttachments: hasAttachments, HasMedia: hasMedia})
 				messageBytes += len(body)
 				for _, attachmentURL := range attachmentURLs {
 					messageBytes += len(attachmentURL)
@@ -394,7 +400,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			var root map[string]string
 			names := map[string]string{}
 			var people func(map[string]string) error
-			if f.category == 0 {
+			if f.category == 0 || f.category == 2 {
 				people = func(m map[string]string) error {
 					if name := cmp.Or(m["global_name"], m["username"]); name != "" && digits(m["id"]) && len(names) < 1<<16 {
 						names[m["id"]] = name
@@ -448,6 +454,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		return e
 	}
 	runStage := func(category int) (int, error) {
+		started := time.Now()
 		phase := []string{"account", "index", "channels", "messages", "activity"}[category]
 		publish(phase, true)
 		results := parallelFiles(ctx, limiter, stages[category], func(f file) error { return processFile(f, phase) })
@@ -464,16 +471,15 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			logger.Warn("Import file incomplete", "slot", slot, "phase", phase)
 		}
 		publish(phase, true)
+		logger.Info("Import phase finished", "slot", slot, "phase", phase, "elapsed_ms", time.Since(started).Milliseconds(), "files", len(stages[category]))
 		return failed, nil
 	}
-	for category := range 3 {
-		failed, e := runStage(category)
-		if e != nil {
-			return e
-		}
-		if category == 0 && failed > 0 {
-			snapshot.Owner = ""
-		}
+	failed, e := runStage(0)
+	if e != nil {
+		return e
+	}
+	if failed > 0 {
+		snapshot.Owner = ""
 	}
 	hasMessages := len(stages[3]) > 0
 	messageFailures, e := runStage(3)
@@ -483,6 +489,15 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 	if hasMessages && messageFailures == 0 {
 		snapshot.Complete = true
 		publish("messages", true)
+	}
+	for _, category := range []int{1, 2} {
+		if _, e := runStage(category); e != nil {
+			return e
+		}
+	}
+	publish("waiting for messages", true)
+	if e := s.WaitMessages(ctx); e != nil {
+		return e
 	}
 	if _, e = runStage(4); e != nil {
 		return e

@@ -45,6 +45,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if v.Revision != m.SearchRevision || v.Value != m.SearchInput.Value() {
 			return m, nil
 		}
+		if !m.validateSearch() {
+			return m, nil
+		}
 		m.Session.Filter.Search = v.Value
 		return m, m.changed()
 	case incidentInputMsg:
@@ -127,11 +130,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pending = pending || s.State == "loading"
 		}
 		cmds := []tea.Cmd{tick(active)}
-		if pending {
+		if pending && time.Since(m.RefreshAt) >= 750*time.Millisecond {
 			cmds = append(cmds, m.refresh())
 		}
-		if m.Tab == tabStats && m.statsStale() && time.Since(m.StatsAt) > time.Second {
-			cmds = append(cmds, m.refreshStats())
+		if m.Tab == tabStats {
+			cmds = append(cmds, m.ensureStats())
 		}
 		return m, tea.Batch(cmds...)
 	case dataMsg:
@@ -147,6 +150,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.refresh()
 		}
 		m.updateImportRates(v.Snapshots, time.Now())
+		m.Catalog = v.Catalog
+		m.validateSearch()
+		m.updateCompletions()
 		m.Rows = v.Rows
 		m.Groups = v.Groups
 		if m.ServerDialog {
@@ -156,6 +162,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sortServers()
 		}
 		m.Days = v.Days
+		if !slices.EqualFunc(m.Snapshots, v.Snapshots, func(a, b store.Snapshot) bool { return a.Slot == b.Slot && a.Path == b.Path && a.Owner == b.Owner }) {
+			m.StatsFilterRevision++
+		}
 		m.Snapshots = v.Snapshots
 		m.Warning = v.Warning
 		if v.Err != nil {
@@ -165,8 +174,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key := snapshotKey(v.Snapshots); key != m.SnapshotKey {
 			m.SnapshotKey = key
 			m.StatsRevision++
-			if m.Tab == tabStats && time.Since(m.StatsAt) > time.Second {
-				return m, m.refreshStats()
+			if m.Tab == tabStats {
+				return m, m.ensureStats()
 			}
 		}
 		return m, nil
@@ -183,10 +192,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case statsMsg:
 		m.StatsLoading = false
-		if v.Revision != m.StatsRevision {
+		if v.FilterRevision != m.StatsFilterRevision {
 			return m, m.refreshStats()
 		}
-		m.StatsAt = time.Now()
 		if v.Err != nil {
 			m.Notice = v.Err.Error()
 			return m, nil
@@ -257,6 +265,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Menu = nil
 		return m, nil
 	case tea.MouseMsg:
+		if m.Focus == "search-input" && !m.SearchDismissed && m.Menu == nil {
+			for _, id := range m.Actions {
+				if strings.HasPrefix(id, "suggest-") && m.Zones.Get(id).InBounds(v) {
+					m.Hover = id
+					if v.Action == tea.MouseActionRelease && v.Button == tea.MouseButtonLeft {
+						return m, m.action(id)
+					}
+					return m, nil
+				}
+			}
+			if m.Zones.Get("search-popup").InBounds(v) {
+				return m, nil
+			}
+		}
 		if m.Picker != nil {
 			local := v
 			local.X -= 2
@@ -420,6 +442,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.menuKey(key)
 		}
 		if key == "esc" {
+			if m.Focus == "search-input" && !m.SearchDismissed {
+				m.SearchDismissed = true
+				return m, nil
+			}
 			if m.Picker != nil {
 				m.rememberBrowsing()
 				m.Picker.Close()
@@ -547,6 +573,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.Focus == "search-input" {
+			if cmd, handled := m.searchKey(key); handled {
+				return m, cmd
+			}
+		}
+		if m.Focus == "command" && key == "tab" && m.Input.CurrentSuggestion() != "" {
+			m.Input.SetValue(m.Input.CurrentSuggestion())
+			m.Input.CursorEnd()
+			m.updateCompletions()
+			return m, nil
+		}
 		if key == "tab" || key == "shift+tab" {
 			i := slices.Index(m.Actions, m.Focus)
 			d := 1
@@ -672,6 +709,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.Tab == tabConsole {
 		m.Input, cmd = m.Input.Update(msg)
+		m.updateCompletions()
 	}
 	if m.Focus == "days-input" {
 		m.DayInput, cmd = m.DayInput.Update(msg)
@@ -704,6 +742,9 @@ func likelyIncidentPaste(runes []rune) bool {
 func (m *Model) action(id string) tea.Cmd {
 	if !m.enabled(id) {
 		return nil
+	}
+	if cmd, ok := m.searchAction(id); ok {
+		return cmd
 	}
 	if strings.HasPrefix(id, "pick-") {
 		if id == "pick-close" {
@@ -1035,6 +1076,9 @@ func (m *Model) action(id string) tea.Cmd {
 		m.Session.Filter.Until = ""
 		return m.changed()
 	case "search-apply":
+		if !m.validateSearch() {
+			return nil
+		}
 		m.SearchRevision++
 		m.Session.Filter.Search = m.SearchInput.Value()
 		m.Focus = "search-input"
@@ -1149,7 +1193,16 @@ func (m *Model) updateSearch(msg tea.Msg, server bool) tea.Cmd {
 	var cmd tea.Cmd
 	*input, cmd = input.Update(msg)
 	if previous != input.Value() {
+		if !server {
+			m.SearchDismissed = false
+			m.SearchSelected = 0
+			m.validateSearch()
+			m.updateCompletions()
+		}
 		return tea.Batch(cmd, m.debounce(server))
+	}
+	if !server {
+		m.updateCompletions()
 	}
 	return cmd
 }

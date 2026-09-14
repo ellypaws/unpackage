@@ -99,9 +99,12 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: guild, Server: m["guild_name"], Kind: kind, Title: title, Recipients: recipients, Rank: 2}
 	}
 
+	eventKind := eventKinds[m["event_type"]]
+	if eventKind == 0 && m["event_type"] != "send_message" {
+		return facts
+	}
 	at, hasTime := eventTime(m["timestamp"])
 	client := platform(m["os"], m["browser"])
-	eventKind := eventKinds[m["event_type"]]
 	if eventKind != 0 && hasTime {
 		e := store.Event{ID: m["event_id"], Kind: eventKind, Time: at, Guild: guild, Channel: channel, Platform: client}
 		if e.ID == "" {

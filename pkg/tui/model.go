@@ -46,6 +46,7 @@ const (
 )
 
 type dataMsg struct {
+	Catalog               store.SearchCatalog
 	Rows                  []store.Row
 	Groups, Servers, Days []store.Group
 	Snapshots             []store.Snapshot
@@ -77,12 +78,18 @@ type dropPathMsg struct {
 	Slot     int
 }
 type Model struct {
+	Catalog                                       store.SearchCatalog
+	SearchError                                   string
+	SearchSuggestions                             []session.Suggestion
+	SearchSelected                                int
+	SearchDismissed                               bool
+	RefreshAt                                     time.Time
 	Session                                       *session.Session
 	ctx                                           context.Context
 	Zones                                         *zone.Manager
 	Width, Height, Tab, Cursor, Offset, Revision  int
 	PendingOffset, ScrollRevision                 int
-	ScrollPending                                 bool
+	ScrollPending, ScrollCached                   bool
 	Frame                                         int
 	Input                                         textinput.Model
 	ServerInput                                   textinput.Model
@@ -133,6 +140,7 @@ type Model struct {
 	StatsMetric                                   store.Metric
 	StatsGuilds, StatsExcludedGuilds              []string
 	StatsRevision, StatsShown                     int
+	StatsFilterRevision                           int
 	StatsLoading                                  bool
 	StatsAt                                       time.Time
 	StatsOffset, StatsPage, StatsTotal            int
@@ -164,6 +172,9 @@ func New(ctx context.Context, s *session.Session) *Model {
 	input.Prompt = "› "
 	input.Placeholder = "Command…"
 	input.CharLimit = 4096
+	input.ShowSuggestions = true
+	input.PromptStyle = lipgloss.NewStyle().Foreground(components.Muted)
+	input.CompletionStyle = lipgloss.NewStyle().Foreground(components.Muted)
 	days := textinput.New()
 	days.Prompt = ""
 	days.Placeholder = "Days ago, YYYY-MM-DD, or unix time"
@@ -173,6 +184,8 @@ func New(ctx context.Context, s *session.Session) *Model {
 	search.Prompt = ""
 	search.Placeholder = "Search messages"
 	search.CharLimit = 1024
+	search.ShowSuggestions = true
+	search.CompletionStyle = lipgloss.NewStyle().Foreground(components.Muted)
 	search.PlaceholderStyle = days.PlaceholderStyle
 	serverInput := textinput.New()
 	serverInput.Prompt = ""
@@ -227,6 +240,7 @@ func (m *Model) refresh() tea.Cmd {
 		return nil
 	}
 	m.Loading = true
+	m.RefreshAt = time.Now()
 	m.QueryRevision++
 	f := m.Session.Filter
 	f.Guilds = slices.Clone(f.Guilds)
@@ -258,12 +272,23 @@ func (m *Model) refresh() tea.Cmd {
 		var errs [4]error
 		var group sync.WaitGroup
 		group.Go(func() { filtered, errs[0] = s.Rows(ctx, full) })
-		group.Go(func() { matching, errs[1] = s.Rows(ctx, matchingFilter) })
+		sameMatching := full.Search == "" && full.Channel == "" && full.Kind == "" && full.Media == "" && len(full.Guilds) == 0 && len(full.ExcludedGuilds) == 0 && !full.HideEventOnly
+		sameMissing := matchingFilter.Mode == "missing" || comparable && (matchingFilter.Mode == "auto" || matchingFilter.Mode == "") && len(matchingFilter.IncidentSeconds) == 0
+		if !sameMatching {
+			group.Go(func() { matching, errs[1] = s.Rows(ctx, matchingFilter) })
+		}
 		group.Go(func() { d.Servers, errs[2] = s.Servers(ctx) })
-		if comparable {
+		if comparable && !sameMissing {
 			group.Go(func() { missing, errs[3] = s.Rows(ctx, missingFilter) })
 		}
 		group.Wait()
+		if sameMatching {
+			matching = filtered
+		}
+		if sameMissing {
+			missing = matching
+		}
+		d.Catalog = s.SearchCatalog(ctx)
 		for _, err := range errs {
 			if err != nil {
 				d.Err = err
@@ -302,6 +327,7 @@ func (m *Model) restartRefresh() tea.Cmd {
 	if m.ScrollPending {
 		m.ScrollRevision++
 		m.ScrollPending = false
+		m.ScrollCached = false
 	}
 	m.interruptRefresh()
 	return m.refresh()
@@ -329,10 +355,15 @@ func (m *Model) queueScroll(delta int) tea.Cmd {
 	}
 	m.PendingOffset = next
 	m.ScrollPending = true
+	m.ScrollCached = m.Session.Store.RowsCached(m.Session.Filter)
 	m.ScrollRevision++
 	revision := m.ScrollRevision
 	m.interruptRefresh()
-	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return scrollMsg{Revision: revision} })
+	delay := 120 * time.Millisecond
+	if m.ScrollCached {
+		delay = 35 * time.Millisecond
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg { return scrollMsg{Revision: revision} })
 }
 
 func (m *Model) changed() tea.Cmd {

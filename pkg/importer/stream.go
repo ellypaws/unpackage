@@ -149,6 +149,7 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 	switch delim {
 	case '{':
 		for d.More() {
+			out["nonempty"] = "1"
 			k, e := d.Token()
 			if e != nil {
 				return nil, e
@@ -161,6 +162,12 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 			child, e := walk(d, depth+1, object, field)
 			if e != nil {
 				return nil, e
+			}
+			if child["nonempty"] == "1" || child["id"] != "" || child["question"] != "" {
+				feature := map[string]string{"embeds": "embed", "poll": "poll", "sticker_items": "sticker", "stickers": "sticker", "message_snapshots": "forward"}[key]
+				if feature != "" {
+					out["has_"+feature] = "1"
+				}
 			}
 			if v, ok := child["$"]; ok {
 				if field != nil {
@@ -179,6 +186,11 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 					}
 				}
 			} else if key == "attachments" {
+				for _, kind := range []string{"image", "video", "sound"} {
+					if child["has_"+kind] == "1" {
+						out["has_"+kind] = "1"
+					}
+				}
 				if child["nonempty"] == "1" || child["has_attachments"] == "1" {
 					out["has_attachments"] = "1"
 				}
@@ -207,6 +219,14 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 		if attachmentMedia(out["content_type"], out["filename"], out["url"]) {
 			out["has_media"] = "1"
 		}
+		for _, kind := range []string{"image", "video", "audio"} {
+			if strings.HasPrefix(strings.ToLower(out["content_type"]), kind+"/") {
+				if kind == "audio" {
+					kind = "sound"
+				}
+				out["has_"+kind] = "1"
+			}
+		}
 		if object != nil {
 			if e = object(out); e != nil {
 				return nil, e
@@ -224,7 +244,7 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 			}
 			value := child["$"]
 			if value == "" {
-				for _, key := range []string{"global_name", "username", "name", "id"} {
+				for _, key := range []string{"id", "global_name", "username", "name"} {
 					if child[key] != "" {
 						value = child[key]
 						break
@@ -247,6 +267,11 @@ func walk(d *json.Decoder, depth int, object func(map[string]string) error, fiel
 			}
 			if child["has_media"] == "1" {
 				out["has_media"] = "1"
+			}
+			for _, kind := range []string{"image", "video", "sound"} {
+				if child["has_"+kind] == "1" {
+					out["has_"+kind] = "1"
+				}
 			}
 			out[attachmentURLsKey] = mergeAttachmentURLs(out[attachmentURLsKey], child["url"], child[attachmentURLsKey])
 		}
