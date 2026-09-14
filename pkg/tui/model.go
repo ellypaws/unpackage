@@ -89,7 +89,7 @@ type Model struct {
 	Zones                                         *zone.Manager
 	Width, Height, Tab, Cursor, Offset, Revision  int
 	PendingOffset, ScrollRevision                 int
-	ScrollPending, ScrollCached                   bool
+	ScrollPending                                 bool
 	Frame                                         int
 	Input                                         textinput.Model
 	ServerInput                                   textinput.Model
@@ -272,7 +272,7 @@ func (m *Model) refresh() tea.Cmd {
 		var errs [4]error
 		var group sync.WaitGroup
 		group.Go(func() { filtered, errs[0] = s.Rows(ctx, full) })
-		sameMatching := full.Search == "" && full.Channel == "" && full.Kind == "" && full.Media == "" && len(full.Guilds) == 0 && len(full.ExcludedGuilds) == 0 && !full.HideEventOnly
+		sameMatching := full.Search == "" && full.Channel == "" && full.Kind == "" && full.Media == "" && len(full.Guilds) == 0 && len(full.ExcludedGuilds) == 0 && len(full.ChannelTypes) == 0 && len(full.ExcludedChannelTypes) == 0 && !full.HideEventOnly
 		sameMissing := matchingFilter.Mode == "missing" || comparable && (matchingFilter.Mode == "auto" || matchingFilter.Mode == "") && len(matchingFilter.IncidentSeconds) == 0
 		if !sameMatching {
 			group.Go(func() { matching, errs[1] = s.Rows(ctx, matchingFilter) })
@@ -327,7 +327,6 @@ func (m *Model) restartRefresh() tea.Cmd {
 	if m.ScrollPending {
 		m.ScrollRevision++
 		m.ScrollPending = false
-		m.ScrollCached = false
 	}
 	m.interruptRefresh()
 	return m.refresh()
@@ -354,16 +353,23 @@ func (m *Model) queueScroll(delta int) tea.Cmd {
 		return nil
 	}
 	m.PendingOffset = next
+	f := m.Session.Filter
+	f.Offset = next
+	f.Limit = m.pageSize()
+	if rows, ok := m.Session.Store.CachedRows(f); ok {
+		m.ScrollRevision++
+		m.ScrollPending = false
+		m.interruptRefresh()
+		m.Offset = next
+		m.Rows = rows
+		m.Cursor = min(m.Cursor, max(0, len(rows)-1))
+		return nil
+	}
 	m.ScrollPending = true
-	m.ScrollCached = m.Session.Store.RowsCached(m.Session.Filter)
 	m.ScrollRevision++
 	revision := m.ScrollRevision
 	m.interruptRefresh()
-	delay := 120 * time.Millisecond
-	if m.ScrollCached {
-		delay = 35 * time.Millisecond
-	}
-	return tea.Tick(delay, func(time.Time) tea.Msg { return scrollMsg{Revision: revision} })
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return scrollMsg{Revision: revision} })
 }
 
 func (m *Model) changed() tea.Cmd {

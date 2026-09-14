@@ -84,6 +84,8 @@ type SentMessage struct {
 	Date                        string
 	Kind                        string
 	KindRank                    int
+	Category                    string
+	CategoryRank                int
 	Time                        time.Time
 	Platform                    string
 	Length, Words               int
@@ -99,10 +101,10 @@ type Message struct {
 	HasLink                    bool
 }
 type ChannelObservation struct {
-	ID, Name, Guild, Server, Kind string
-	Title, Recipients             string
-	Rank, GuildRank               int
-	ServerRank, KindRank          int
+	ID, Name, Guild, Server, Kind, Category string
+	Title, Recipients                       string
+	Rank, GuildRank                         int
+	ServerRank, KindRank, CategoryRank      int
 }
 type IdentityObservation struct {
 	Username, GlobalName, Aliases string
@@ -121,6 +123,7 @@ type Row struct {
 	Server         string   `json:"server"`
 	Name           string   `json:"channel"`
 	Kind           string   `json:"kind"`
+	Category       string   `json:"category"`
 	Status         string   `json:"status"`
 	HasAttachments bool     `json:"has_attachments"`
 	HasMedia       bool     `json:"has_media"`
@@ -138,6 +141,11 @@ type Row struct {
 	NameFallback   bool     `json:"channel_fallback,omitempty"`
 	ServerFallback bool     `json:"server_fallback,omitempty"`
 }
+
+func (r Row) ContentUnavailable() bool {
+	return r.Status == "missing" || !r.MessageRecord
+}
+
 type Group struct {
 	ID, Name string
 	Count    int
@@ -147,6 +155,7 @@ type Group struct {
 type Filter struct {
 	Mode, Search, Channel, Kind, Media string
 	Guilds, ExcludedGuilds, Dates      []string
+	ChannelTypes, ExcludedChannelTypes []string
 	IncidentSeconds                    map[int64]int64
 	From, Until                        string
 	Limit, Offset                      int
@@ -162,10 +171,11 @@ type Snapshot struct {
 }
 type channel struct {
 	name, guild, server, kind string
+	category                  string
 	title, recipients         string
 	nameRank, guildRank       int
 	serverRank, kindRank      int
-	titleRank                 int
+	categoryRank, titleRank   int
 	conflict                  bool
 	conflictRank              int
 	privateRank               int
@@ -619,6 +629,10 @@ func mergeSentMessage(a, b SentMessage) SentMessage {
 		a.Kind = b.Kind
 		a.KindRank = b.KindRank
 	}
+	if preferField(a.Category, a.CategoryRank, b.Category, b.CategoryRank) {
+		a.Category = b.Category
+		a.CategoryRank = b.CategoryRank
+	}
 	a.Platform = mergeDescription(a.Platform, b.Platform)
 	if a.Time.IsZero() || !b.Time.IsZero() && b.Time.Before(a.Time) {
 		a.Time = b.Time
@@ -639,7 +653,7 @@ func sentChannel(sent SentMessage) channel {
 		kind = "guild"
 		rank = 2
 	}
-	return channelObservation("", sent.Guild, "", kind, "", "", rank, rank)
+	return channelObservation("", sent.Guild, "", kind, sent.Category, "", "", rank, rank, sent.CategoryRank)
 }
 
 // SentMessages merges repeated send_message records from Activity files by message ID.
@@ -793,6 +807,10 @@ func merge(a, b channel) channel {
 	if preferDisplayField(a.title, a.titleRank, b.title, b.titleRank) {
 		a.title = b.title
 		a.titleRank = b.titleRank
+	}
+	if preferField(a.category, a.categoryRank, b.category, b.categoryRank) {
+		a.category = b.category
+		a.categoryRank = b.categoryRank
 	}
 	a.recipients = mergeRecipientEvidence(a.recipients, b.recipients)
 	if a.kind == "dm" && b.kind == "unknown-dm" || a.kind == "unknown-dm" && b.kind == "dm" {
@@ -949,10 +967,10 @@ func preferField(current string, currentRank int, candidate string, candidateRan
 	return candidate != "" && (current == "" || candidateRank > currentRank || candidateRank == currentRank && strings.Compare(candidate, current) < 0)
 }
 
-func channelObservation(name, guild, server, kind, title, recipients string, rank, kindRank int) channel {
+func channelObservation(name, guild, server, kind, category, title, recipients string, rank, kindRank, categoryRank int) channel {
 	_, _, labelKind := ClassifyChannelLabel(name)
 	labelPrivate := guild == "" && kind != "guild" && (labelKind == "dm" || labelKind == "unknown-dm")
-	c := channel{name: name, guild: guild, server: server, kind: kind, title: title, recipients: recipients}
+	c := channel{name: name, guild: guild, server: server, kind: kind, category: category, title: title, recipients: recipients}
 	if labelPrivate {
 		c.privateRank = rank
 	}
@@ -980,10 +998,33 @@ func channelObservation(name, guild, server, kind, title, recipients string, ran
 	if kind != "" {
 		c.kindRank = kindRank
 	}
+	if category != "" {
+		c.categoryRank = categoryRank
+	}
 	if title != "" {
 		c.titleRank = rank
 	}
 	return c
+}
+
+func channelCategory(c channel) string {
+	switch c.kind {
+	case "dm", "unknown-dm":
+		return "dm"
+	case "group":
+		return "group"
+	case "guild":
+		if c.category == "thread" {
+			return "thread"
+		}
+		return "server"
+	default:
+		return "unknown"
+	}
+}
+
+func channelTypeAllowed(included, excluded []string, category string) bool {
+	return (len(included) == 0 || slices.Contains(included, category)) && !slices.Contains(excluded, category)
 }
 
 func sameOwner(a, b *Snapshot) bool {
@@ -1155,7 +1196,11 @@ func (s *Store) Channels(ctx context.Context, slot int, observations []ChannelOb
 		if observation.Kind != "" && observation.KindRank > 0 {
 			kindRank = observation.KindRank
 		}
-		candidate := channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank, kindRank)
+		categoryRank := observation.Rank
+		if observation.Category != "" && observation.CategoryRank > 0 {
+			categoryRank = observation.CategoryRank
+		}
+		candidate := channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Category, observation.Title, observation.Recipients, observation.Rank, kindRank, categoryRank)
 		if observation.Guild != "" && observation.GuildRank > 0 {
 			candidate.guildRank = observation.GuildRank
 		}
@@ -1295,15 +1340,20 @@ func (s *Store) cachedRows(key string, now time.Time) ([]Row, uint64, bool) {
 	return entry.rows, version, true
 }
 
-func (s *Store) RowsCached(f Filter) bool {
-	_, _, ok := s.cachedRows(rowFilterKey(f), time.Now())
-	return ok
+func (s *Store) CachedRows(f Filter) ([]Row, bool) {
+	offset, limit := f.Offset, f.Limit
+	f.Offset, f.Limit = 0, 0
+	rows, _, ok := s.cachedRows(rowFilterKey(f), time.Now())
+	if !ok {
+		return nil, false
+	}
+	return pageRows(rows, offset, limit), true
 }
 
 func cachedRowsSize(key string, rows []Row) int64 {
 	size := int64(len(key))
 	for _, row := range rows {
-		size += 288 + int64(len(row.ID)+len(row.Channel)+len(row.Date)+len(row.Content)+len(row.Guild)+len(row.Server)+len(row.Name)+len(row.Kind)+len(row.Status)+len(row.SendEventID)+len(row.SendTime)+len(row.Platform))
+		size += 288 + int64(len(row.ID)+len(row.Channel)+len(row.Date)+len(row.Content)+len(row.Guild)+len(row.Server)+len(row.Name)+len(row.Kind)+len(row.Category)+len(row.Status)+len(row.SendEventID)+len(row.SendTime)+len(row.Platform))
 		for _, value := range row.AttachmentURLs {
 			size += 16 + int64(len(value))
 		}
@@ -1426,7 +1476,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			mode = "missing"
 		}
 	}
-	if slices.Contains([]string{"missing", "present", "new"}, mode) && !ok {
+	if slices.Contains([]string{"present", "new"}, mode) && !ok {
 		s.mu.RUnlock()
 		return nil, fmt.Errorf("%s", cmp.Or(why, "Open both packages to compare"))
 	}
@@ -1438,12 +1488,18 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		s.mu.RUnlock()
 		return nil, fmt.Errorf("unknown media filter %q", f.Media)
 	}
+	for _, category := range append(slices.Clone(f.ChannelTypes), f.ExcludedChannelTypes...) {
+		if !slices.Contains([]string{"server", "dm", "group", "thread", "unknown"}, category) {
+			s.mu.RUnlock()
+			return nil, fmt.Errorf("unknown channel type %q", category)
+		}
+	}
 	type resolvedChannel struct {
 		channel channel
 		name    displayValue
 		allowed bool
 	}
-	type channelKey struct{ id, guild, kind string }
+	type channelKey struct{ id, guild, kind, category string }
 	type item struct {
 		m             Message
 		sent          SentMessage
@@ -1464,10 +1520,10 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	items := make([]item, 0, capacity)
 	for slot := range 2 {
 		resolvedChannels := map[channelKey]*resolvedChannel{}
-		if mode == "older" && slot != 0 || mode == "newer" && slot != 1 || mode == "new" && slot != 1 || (mode == "missing" || mode == "present") && slot != 0 {
+		if mode == "older" && slot != 0 || mode == "newer" && slot != 1 || mode == "new" && slot != 1 || mode == "present" && slot != 0 {
 			continue
 		}
-		if mode == "all" && !same && ((a != nil && slot != 0) || (a == nil && slot != 1)) {
+		if (mode == "all" || mode == "missing") && !same && ((a != nil && slot != 0) || (a == nil && slot != 1)) {
 			continue
 		}
 		candidates := s.observedMessagesLocked(slot)
@@ -1572,7 +1628,16 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			_, inOldRecord := s.messages[0][m.ID]
 			_, inNewRecord := s.messages[1][m.ID]
 			inOld := s.hasObservedMessageLocked(0, m.ID)
-			if mode == "missing" && inNewRecord || mode == "present" && (!inOldRecord || !inNewRecord) || mode == "new" && inOld || mode == "all" && same && s.skipCombinedMessage(slot, m.ID) {
+			missing := !observed.MessageRecord
+			if same {
+				missing = !inNewRecord
+			}
+			skipCombined := same && s.skipCombinedMessage(slot, m.ID)
+			skip := mode == "missing" && (!missing || skipCombined) ||
+				mode == "present" && (!inOldRecord || !inNewRecord) ||
+				mode == "new" && inOld ||
+				mode == "all" && skipCombined
+			if skip {
 				continue
 			}
 			if f.HideEventOnly && !observed.MessageRecord && !(same && (inOldRecord || inNewRecord)) {
@@ -1589,7 +1654,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			if f.Channel != "" && f.Channel != m.Channel {
 				continue
 			}
-			key := channelKey{m.Channel, sent.Guild, sent.Kind}
+			key := channelKey{m.Channel, sent.Guild, sent.Kind, sent.Category}
 			resolved, cached := resolvedChannels[key]
 			if !cached {
 				c := s.channels[slot][m.Channel]
@@ -1607,14 +1672,15 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				if c.conflict {
 					guild = ""
 				}
-				allowed := (len(f.Guilds) == 0 || slices.Contains(f.Guilds, guild)) && !slices.Contains(f.ExcludedGuilds, guild) && (f.Kind == "" || f.Kind == c.kind) && query.channelMatches(c, m.Channel, name.text, owner, lookup)
+				category := channelCategory(c)
+				allowed := (len(f.Guilds) == 0 || slices.Contains(f.Guilds, guild)) && !slices.Contains(f.ExcludedGuilds, guild) && (f.Kind == "" || f.Kind == c.kind) && channelTypeAllowed(f.ChannelTypes, f.ExcludedChannelTypes, category) && query.channelMatches(c, m.Channel, name.text, owner, lookup)
 				resolved = &resolvedChannel{c, name, allowed}
 				resolvedChannels[key] = resolved
 			}
 			if !resolved.allowed || f.Media == "attachments" && !m.HasAttachments || f.Media == "media" && !m.HasMedia {
 				continue
 			}
-			items = append(items, item{m: m, sent: sent, c: resolved, messageRecord: observed.MessageRecord, foundInNew: inNewRecord, missing: same && slot == 0 && !inNewRecord})
+			items = append(items, item{m: m, sent: sent, c: resolved, messageRecord: observed.MessageRecord, foundInNew: inNewRecord, missing: missing})
 		}
 	}
 	s.mu.RUnlock()
@@ -1650,20 +1716,20 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		}
 		server := serverDisplay(c)
 		status := "observed"
-		if v.missing {
+		if !v.messageRecord {
+			status = "send event only"
+		} else if v.missing {
 			status = "missing"
 		} else if incidentAuto && v.foundInNew {
 			status = "found in newer"
 		} else if mode == "present" || mode == "new" {
 			status = mode
-		} else if !v.messageRecord {
-			status = "send event only"
 		}
 		sendTime := ""
 		if !v.sent.Time.IsZero() {
 			sendTime = v.sent.Time.Format(time.RFC3339Nano)
 		}
-		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server.text, Name: v.c.name.text, Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs), MessageRecord: v.messageRecord, SendEvent: v.sent.ID != "", Sources: sourceNames(v.sent.Sources, v.messageRecord), SendEventID: v.sent.EventID, SendTime: sendTime, Platform: v.sent.Platform, ReportedLength: v.sent.Length, ReportedWords: v.sent.Words, ReportedURLs: v.sent.URLs, ReportedFiles: v.sent.Attachments, NameFallback: v.c.name.fallback, ServerFallback: server.fallback})
+		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server.text, Name: v.c.name.text, Kind: cmp.Or(c.kind, "unknown"), Category: channelCategory(c), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs), MessageRecord: v.messageRecord, SendEvent: v.sent.ID != "", Sources: sourceNames(v.sent.Sources, v.messageRecord), SendEventID: v.sent.EventID, SendTime: sendTime, Platform: v.sent.Platform, ReportedLength: v.sent.Length, ReportedWords: v.sent.Words, ReportedURLs: v.sent.URLs, ReportedFiles: v.sent.Attachments, NameFallback: v.c.name.fallback, ServerFallback: server.fallback})
 	}
 	s.cacheRows(cacheKey, cacheVersion, rows, now)
 	return pageRows(rows, offset, limit), nil
@@ -1711,6 +1777,9 @@ func GroupRows(rows []Row, dates bool) []Group {
 			group.Fallback = group.Fallback && fallback
 		}
 		group.Count++
+		if r.ContentUnavailable() {
+			group.Missing++
+		}
 		groups[key] = group
 	}
 	out := slices.Collect(maps.Values(groups))

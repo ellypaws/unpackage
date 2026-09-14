@@ -17,7 +17,7 @@ type Suggestion struct {
 }
 
 var searchGuidance = map[string]string{
-	"from": "People and conversation participants", "in": "Channel or conversation", "server": "Server", "mentions": "Mentions a user", "has": "Message contains", "type": "DM, group, or server channel", "before": "Before a date", "after": "After a date", "on": "On a date", "id": "Exact message ID", "regex": "Regular expression, (?i) ignores case",
+	"from": "People and conversation participants", "in": "Channel or conversation", "server": "Server", "mentions": "Mentions a user", "has": "Message contains", "type": "DM, group, server channel, thread, or unknown", "before": "Before a date", "after": "After a date", "on": "On a date", "id": "Exact message ID", "regex": "Regular expression, (?i) ignores case",
 }
 
 func CompleteSearch(text string, cursor int, catalog store.SearchCatalog) []Suggestion {

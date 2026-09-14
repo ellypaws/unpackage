@@ -395,12 +395,14 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					gid = m["guild"]
 				}
 				kind := channelKind(m["type"], gid)
+				category := channelCategory(m["type"], gid)
 				if kind == "" {
 					kind = "unknown"
 				}
-				observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Recipients: m["recipients"], Rank: sourcePriority(3, slot)}
+				priority := sourcePriority(3, slot)
+				observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Category: category, Recipients: m["recipients"], Rank: priority, KindRank: priority, CategoryRank: priority}
 				if kind == "group" {
-					observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: sourcePriority(3, slot)}
+					observation = store.ChannelObservation{ID: f.channel, Kind: "group", Category: "group", Title: m["name"], Recipients: m["recipients"], Rank: priority, KindRank: priority, CategoryRank: priority}
 				}
 				metadata = append(metadata, observation)
 			case 3:
@@ -441,8 +443,10 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				facts.Channel.GuildRank = sourcePriority(facts.Channel.GuildRank, slot)
 				facts.Channel.ServerRank = sourcePriority(facts.Channel.ServerRank, slot)
 				facts.Channel.KindRank = sourcePriority(facts.Channel.KindRank, slot)
+				facts.Channel.CategoryRank = sourcePriority(facts.Channel.CategoryRank, slot)
 				facts.Server.Rank = sourcePriority(facts.Server.Rank, slot)
 				facts.Sent.KindRank = sourcePriority(facts.Sent.KindRank, slot)
+				facts.Sent.CategoryRank = sourcePriority(facts.Sent.CategoryRank, slot)
 				if e := collectServer(facts.Server); e != nil {
 					return e
 				}
@@ -487,9 +491,10 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				case "channels.json":
 					id := m["id"]
 					kind := channelKind(m["type"], f.guild)
+					category := channelCategory(m["type"], f.guild)
 					if digits(id) && m["name"] != "" && kind == "guild" {
 						priority := sourcePriority(4, slot)
-						metadata = append(metadata, store.ChannelObservation{ID: id, Name: m["name"], Guild: f.guild, Kind: kind, Rank: priority, KindRank: priority})
+						metadata = append(metadata, store.ChannelObservation{ID: id, Name: m["name"], Guild: f.guild, Kind: kind, Category: category, Rank: priority, KindRank: priority, CategoryRank: priority})
 					}
 				}
 			}

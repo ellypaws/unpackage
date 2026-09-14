@@ -21,7 +21,7 @@ type SearchToken struct {
 
 var SearchKeys = []string{"from", "in", "server", "mentions", "has", "type", "before", "after", "on", "id", "regex"}
 var SearchHas = []string{"image", "video", "sound", "link", "file", "embed", "poll", "sticker", "forward"}
-var SearchTypes = []string{"dm", "group", "server", "unknown"}
+var SearchTypes = []string{"dm", "group", "server", "thread", "unknown"}
 
 type SearchQuery struct {
 	Tokens   []SearchToken
@@ -99,7 +99,7 @@ func ParseSearch(text string) (SearchQuery, error) {
 			}
 		case "type":
 			if !slices.Contains(SearchTypes, strings.ToLower(t.Value)) {
-				return q, fmt.Errorf("Use type:dm, group, server, or unknown")
+				return q, fmt.Errorf("Use type:dm, group, server, thread, or unknown")
 			}
 		case "before", "after", "on":
 			if _, err := time.Parse(time.DateOnly, t.Value); err != nil {
@@ -183,17 +183,7 @@ func (q SearchQuery) channelMatches(c channel, id, label, owner string, lookup f
 		case "in":
 			return searchEqual(t.Value, id, label, c.name, c.title)
 		case "type":
-			kind := c.kind
-			if kind == "guild" {
-				kind = "server"
-			}
-			if kind == "unknown-dm" {
-				kind = "dm"
-			}
-			if kind == "" || kind == "conflict" {
-				kind = "unknown"
-			}
-			return strings.EqualFold(t.Value, kind)
+			return strings.EqualFold(t.Value, channelCategory(c))
 		case "from":
 			if searchEqual(t.Value, owner, lookup(owner), "me") {
 				return true

@@ -46,10 +46,6 @@ func (m *Model) checkbox(id, label string, checked bool) string {
 	return m.Zones.Mark(id, style.Render(mark+" "+label))
 }
 
-func unavailableStatus(status string) bool {
-	return status == "missing" || status == "send event only"
-}
-
 func (m *Model) bodyHeight() int {
 	if m.Tab == tabConsole {
 		return max(3, m.Height-12)
@@ -99,7 +95,7 @@ func (m *Model) workLabel() string {
 	if m.IncidentProcessing != "" {
 		return m.IncidentProcessing
 	}
-	if m.ScrollPending && !m.ScrollCached {
+	if m.ScrollPending {
 		return "Scrolling…"
 	}
 	if m.ServerDialog && m.ServerInput.Value() != m.ServerSearch {
@@ -302,20 +298,13 @@ func (m *Model) View() string {
 		r := m.Detail
 		m.Viewport.Width = w - 4
 		m.Viewport.Height = h - 3
-		messageColor := components.Text
-		if unavailableStatus(r.Status) {
-			messageColor = components.Deleted
-		}
-		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(messageColor))
+		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text))
 		if strings.TrimSpace(r.Content) == "" {
 			unavailable := "No text content"
 			if r.SendEvent && !r.MessageRecord {
 				unavailable = "Content is not included in the send_message analytics event."
 			}
 			emptyColor := components.Muted
-			if unavailableStatus(r.Status) {
-				emptyColor = components.Deleted
-			}
 			messageContent = lipgloss.NewStyle().Foreground(emptyColor).Render(unavailable)
 		}
 		attachments := lipgloss.NewStyle().Foreground(components.Muted).Render("None")
@@ -593,7 +582,7 @@ func displayChannel(r store.Row) string {
 }
 
 func styledMessageLocation(r store.Row, width int, base lipgloss.Color, distance int, active, bold bool) string {
-	missing := unavailableStatus(r.Status)
+	missing := r.ContentUnavailable()
 	serverColor := components.Fade(base, distance)
 	channelColor := components.Fade(base, distance)
 	separatorColor := components.Fade(components.Muted, distance)
@@ -680,6 +669,8 @@ func (m *Model) filters(w int) string {
 	parts = append(parts, m.button("margin", components.Fit(margin, w-3), f.DateBefore > 0 || f.DateAfter > 0))
 	media := optionLabel(mediaOptions, f.Media)
 	parts = append(parts, m.dropdown("media", components.Fit(media, w-5), f.Media != ""))
+	m.Tips["channel-types"] = "Each channel type cycles through include, exclude, and neutral. Neutral for every type means All."
+	parts = append(parts, m.dropdown("channel-types", components.Fit(channelTypesLabel(f.ChannelTypes, f.ExcludedChannelTypes), w-5), len(f.ChannelTypes) > 0 || len(f.ExcludedChannelTypes) > 0))
 	m.Tips["hide-event-only"] = "Hide messages absent from both Messages exports and recovered only from send_message analytics."
 	parts = append(parts, m.checkbox("hide-event-only", "Hide send-event-only messages", f.HideEventOnly))
 	servers := serverSelectionLabel(f.Guilds, f.ExcludedGuilds)
@@ -723,7 +714,7 @@ func (m *Model) results(w, h int) string {
 	}
 	total := m.resultCount()
 	label := "messages"
-	if len(m.Rows) > 0 && m.Rows[0].Status == "missing" && (m.Session.Filter.Mode == "missing" || len(m.Session.Filter.IncidentSeconds) == 0) {
+	if m.Session.Filter.Mode == "missing" || len(m.Rows) > 0 && m.Rows[0].ContentUnavailable() && len(m.Session.Filter.IncidentSeconds) == 0 {
 		label = "missing messages"
 	}
 	if total == 1 {
@@ -837,13 +828,11 @@ func (m *Model) messages(w, h int) string {
 		}
 		hover := active == i
 		metaColor := components.Accent
-		if unavailableStatus(r.Status) {
+		if r.ContentUnavailable() {
 			metaColor = components.Deleted
 		}
 		contentColor := components.Text
-		if unavailableStatus(r.Status) {
-			contentColor = components.Deleted
-		} else if r.SendEvent && !r.MessageRecord {
+		if r.SendEvent && !r.MessageRecord {
 			contentColor = components.Muted
 		}
 		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(contentColor, distance))

@@ -39,7 +39,7 @@ before YYYY-MM-DD          Before creation date
 search QUERY               Search messages with text and filters
   from:PERSON in:CHANNEL server:SERVER mentions:USER
   has:image|video|sound|link|file|embed|poll|sticker|forward
-  type:dm|group|server|unknown before:DATE after:DATE on:DATE
+  type:dm|group|server|thread|unknown before:DATE after:DATE on:DATE
   regex:"(?i)pattern" id:MESSAGE_ID, -filter:value excludes
 channel ID                 Filter one channel
 kind guild|dm|group|unknown-dm|unknown|conflict|all

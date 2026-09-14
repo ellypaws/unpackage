@@ -446,7 +446,7 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 				continue
 			}
 			_, inNewRecord := s.messages[1][m.ID]
-			missing := comparable && slot == 0 && !inNewRecord
+			missing := !observed.MessageRecord || comparable && slot == 0 && !inNewRecord
 			if st.FirstMessage.IsZero() || t.Before(st.FirstMessage) {
 				st.FirstMessage = t
 			}

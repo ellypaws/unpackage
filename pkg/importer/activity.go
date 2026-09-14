@@ -75,6 +75,25 @@ func channelKind(value, guild string) string {
 	return ""
 }
 
+func channelCategory(value, guild string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "1", "DM":
+		return "dm"
+	case "3", "GROUP_DM":
+		return "group"
+	case "10", "11", "12", "ANNOUNCEMENT_THREAD", "PUBLIC_THREAD", "PRIVATE_THREAD":
+		return "thread"
+	case "0", "2", "4", "5", "6", "13", "14", "15", "16",
+		"GUILD_TEXT", "GUILD_VOICE", "GUILD_CATEGORY", "GUILD_ANNOUNCEMENT", "GUILD_NEWS", "GUILD_STORE",
+		"GUILD_STAGE_VOICE", "GUILD_DIRECTORY", "GUILD_FORUM", "GUILD_MEDIA":
+		return "server"
+	}
+	if guild != "" {
+		return "server"
+	}
+	return ""
+}
+
 func activityCount(v string) int {
 	return int(min(integer(v), 1<<31-1))
 }
@@ -83,6 +102,7 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 	channel, guild := activityChannel(m)
 	eventType := m["event_type"]
 	kind := channelKind(m["channel_type"], "")
+	category := channelCategory(m["channel_type"], "")
 	structuredKind := kind != ""
 	kindRank := 0
 	if structuredKind {
@@ -131,7 +151,7 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 	}
 	facts := activityFacts{}
 	if channel != "" && (name != "" || channelGuild != "" || channelServer != "" || kind != "" || title != "" || recipients != "") {
-		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: channelGuild, Server: channelServer, Kind: kind, Title: title, Recipients: recipients, Rank: 2, GuildRank: guildRank, ServerRank: serverRank, KindRank: kindRank}
+		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: channelGuild, Server: channelServer, Kind: kind, Category: category, Title: title, Recipients: recipients, Rank: 2, GuildRank: guildRank, ServerRank: serverRank, KindRank: kindRank, CategoryRank: kindRank}
 	}
 	if guild != "" && server != "" {
 		facts.Server = store.ServerObservation{ID: guild, Name: server, Rank: serverRank}
@@ -178,20 +198,22 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 			eventID = ""
 		}
 		facts.Sent = store.SentMessage{
-			ID:          m["message_id"],
-			EventID:     eventID,
-			Channel:     channel,
-			Guild:       guild,
-			Kind:        kind,
-			KindRank:    kindRank,
-			Time:        at,
-			Platform:    client,
-			Length:      activityCount(m["length"]),
-			Words:       activityCount(m["word_count"]),
-			URLs:        activityCount(m["num_urls"]),
-			Attachments: activityCount(m["num_attachments"]),
-			HasMedia:    attachmentMedia(m["attachment_content_types"], m["attachment_mimetypes"]),
-			Sources:     source,
+			ID:           m["message_id"],
+			EventID:      eventID,
+			Channel:      channel,
+			Guild:        guild,
+			Kind:         kind,
+			KindRank:     kindRank,
+			Category:     category,
+			CategoryRank: kindRank,
+			Time:         at,
+			Platform:     client,
+			Length:       activityCount(m["length"]),
+			Words:        activityCount(m["word_count"]),
+			URLs:         activityCount(m["num_urls"]),
+			Attachments:  activityCount(m["num_attachments"]),
+			HasMedia:     attachmentMedia(m["attachment_content_types"], m["attachment_mimetypes"]),
+			Sources:      source,
 		}
 	}
 	return facts

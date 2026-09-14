@@ -150,9 +150,7 @@ func (m *Model) messageFilter(l store.Leader, metric store.Metric) (store.Filter
 	}
 	switch metric {
 	case store.MetricMissing:
-		if ok, _ := m.Session.Store.Compatible(m.ctx); ok {
-			f.Mode = "missing"
-		}
+		f.Mode = "missing"
 	case store.MetricMedia:
 		f.Media = "media"
 	case store.MetricAttachments:
@@ -1048,13 +1046,11 @@ func (m *Model) statsMessages(w, h int) string {
 		distance := fadeDistance(active, i)
 		hover := i == active
 		metaColor := components.Accent
-		if unavailableStatus(r.Status) {
+		if r.ContentUnavailable() {
 			metaColor = components.Deleted
 		}
 		contentColor := components.Text
-		if unavailableStatus(r.Status) {
-			contentColor = components.Deleted
-		} else if r.SendEvent && !r.MessageRecord {
+		if r.SendEvent && !r.MessageRecord {
 			contentColor = components.Muted
 		}
 		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(contentColor, distance))

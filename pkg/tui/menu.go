@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	modeOptions  = []option{{"auto", "Auto"}, {"missing", "Missing"}, {"all", "All"}, {"older", "Older"}, {"newer", "Newer"}, {"present", "In both"}, {"new", "New"}}
-	mediaOptions = []option{{"", "All messages"}, {"attachments", "Messages with attachments"}, {"media", "Images, video or audio"}}
+	modeOptions        = []option{{"auto", "Auto"}, {"missing", "Missing"}, {"all", "All"}, {"older", "Older"}, {"newer", "Newer"}, {"present", "In both"}, {"new", "New"}}
+	mediaOptions       = []option{{"", "All messages"}, {"attachments", "Messages with attachments"}, {"media", "Images, video or audio"}}
+	channelTypeOptions = []option{{"server", "Server channels"}, {"dm", "Direct messages"}, {"group", "Group DMs"}, {"thread", "Threads"}, {"unknown", "Unknown"}}
 )
 
 // menu is an open dropdown anchored to the control that opened it.
@@ -79,6 +80,8 @@ func (m *Model) menuFor(id string) (options []option, current string, preview bo
 		return modeOptions, m.Session.Filter.Mode, false, true
 	case "media":
 		return mediaOptions, m.Session.Filter.Media, false, true
+	case "channel-types":
+		return channelTypeOptions, "", false, true
 	}
 	return nil, "", false, false
 }
@@ -116,6 +119,10 @@ func (m *Model) setOption(id, key string) {
 }
 
 func (m *Model) chooseOption(id, key string) tea.Cmd {
+	if id == "channel-types" {
+		m.toggleChannelType(key)
+		return m.changed()
+	}
 	_, current, _, _ := m.menuFor(id)
 	m.setOption(id, key)
 	if key == current {
@@ -145,6 +152,9 @@ func (m *Model) openMenu(id string) {
 		return
 	}
 	hovered := slices.IndexFunc(options, func(o option) bool { return o.key == current })
+	if id == "channel-types" && hovered < 0 && len(options) > 0 {
+		hovered = 0
+	}
 	m.Menu = &menu{ID: id, Options: options, Current: current, Hovered: hovered, Preview: preview}
 	m.Focus = id
 }
@@ -176,7 +186,9 @@ func (m *Model) menuKey(key string) tea.Cmd {
 		menu.Hovered = (menu.Hovered + step + len(menu.Options)) % len(menu.Options)
 	case "enter", " ":
 		if menu.Hovered >= 0 && menu.Hovered < len(menu.Options) {
-			m.Menu = nil
+			if menu.ID != "channel-types" {
+				m.Menu = nil
+			}
 			return m.chooseOption(menu.ID, menu.Options[menu.Hovered].key)
 		}
 		m.Menu = nil
@@ -189,7 +201,9 @@ func (m *Model) menuClick() tea.Cmd {
 	menu := m.Menu
 	if index, ok := strings.CutPrefix(m.Hover, "menu-"); ok {
 		if i, err := strconv.Atoi(index); err == nil && i >= 0 && i < len(menu.Options) {
-			m.Menu = nil
+			if menu.ID != "channel-types" {
+				m.Menu = nil
+			}
 			return m.chooseOption(menu.ID, menu.Options[i].key)
 		}
 		return nil
@@ -214,7 +228,7 @@ func (m *Model) overlayMenu(frame string) string {
 	}
 	width := 8
 	for _, o := range menu.Options {
-		width = max(width, lipgloss.Width(o.label)+4)
+		width = max(width, lipgloss.Width(o.label)+6)
 	}
 	width = min(width, m.Width-4)
 	var lines []string
@@ -223,14 +237,27 @@ func (m *Model) overlayMenu(frame string) string {
 		m.Actions = append(m.Actions, id)
 		style := lipgloss.NewStyle().Width(width).Padding(0, 1).Foreground(components.Text)
 		marker := "  "
-		if o.key == menu.Current {
+		if menu.ID == "channel-types" {
+			marker = "[ ] "
+			if slices.Contains(m.Session.Filter.ChannelTypes, o.key) {
+				style = style.Foreground(components.Accent).Bold(true)
+				marker = "[+] "
+			} else if slices.Contains(m.Session.Filter.ExcludedChannelTypes, o.key) {
+				style = style.Foreground(components.Deleted).Bold(true)
+				marker = "[-] "
+			}
+		} else if o.key == menu.Current {
 			style = style.Foreground(components.Accent).Bold(true)
 			marker = "• "
 		}
 		if i == menu.Hovered {
 			style = style.Background(components.SurfaceHover).Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
 		}
-		lines = append(lines, m.Zones.Mark(id, style.Render(marker+components.Fit(o.label, width-4))))
+		fitWidth := width - 4
+		if menu.ID == "channel-types" {
+			fitWidth = width - 6
+		}
+		lines = append(lines, m.Zones.Mark(id, style.Render(marker+components.Fit(o.label, fitWidth))))
 	}
 	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(components.Accent).Background(components.Surface).Render(strings.Join(lines, "\n"))
 	m.Actions = append(m.Actions, "menu")
@@ -247,6 +274,34 @@ func (m *Model) overlayMenu(frame string) string {
 	x = min(max(0, x), max(0, m.Width-boxWidth))
 	y = min(max(0, y), max(0, m.Height-boxHeight))
 	return components.Overlay(frame, box, x, y)
+}
+
+func (m *Model) toggleChannelType(category string) {
+	included := &m.Session.Filter.ChannelTypes
+	excluded := &m.Session.Filter.ExcludedChannelTypes
+	if i := slices.Index(*included, category); i >= 0 {
+		*included = slices.Delete(*included, i, i+1)
+		*excluded = append(*excluded, category)
+	} else if i := slices.Index(*excluded, category); i >= 0 {
+		*excluded = slices.Delete(*excluded, i, i+1)
+	} else {
+		*included = append(*included, category)
+	}
+	slices.Sort(*included)
+	slices.Sort(*excluded)
+}
+
+func channelTypesLabel(included, excluded []string) string {
+	if len(included) == 0 && len(excluded) == 0 {
+		return "Channel types: All"
+	}
+	if len(included)+len(excluded) == 1 {
+		if len(included) == 1 {
+			return "Channel types: " + optionLabel(channelTypeOptions, included[0])
+		}
+		return "Channel types: not " + optionLabel(channelTypeOptions, excluded[0])
+	}
+	return fmt.Sprintf("Channel types: +%d, -%d", len(included), len(excluded))
 }
 
 // figures remember the last value shown for each number so a change can flash by its relative size and settle.
