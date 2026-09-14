@@ -187,13 +187,22 @@ func (m *Model) overlaySearch(frame string) string {
 	for i := start; i < min(len(m.SearchSuggestions), start+count); i++ {
 		s := m.SearchSuggestions[i]
 		id := fmt.Sprintf("suggest-%d", i)
-		style := lipgloss.NewStyle().Foreground(components.Text).Background(components.Surface).Width(width-2).Padding(0, 1)
-		if i == m.SearchSelected || m.Hover == id {
-			style = style.Background(components.SurfaceHover).Foreground(components.Accent).Bold(true)
+		active := i == m.SearchSelected || m.Hover == id
+		style := lipgloss.NewStyle().Background(components.Surface).Width(width-2).Padding(0, 1)
+		if active {
+			style = style.Background(components.SurfaceHover)
 		}
-		label := components.Fit(session.Safe(s.Label), width-4)
+		labelColor := components.Text
+		if s.Fallback {
+			labelColor = components.Muted
+		} else if s.Kind == "group" {
+			labelColor = components.GroupDM
+		} else if active {
+			labelColor = components.Accent
+		}
+		label := lipgloss.NewStyle().Foreground(labelColor).Bold(active).Render(components.Fit(session.Safe(s.Label), width-4))
 		if s.Detail != "" {
-			label += "\n" + components.Fit(session.Safe(s.Detail), width-4)
+			label += "\n" + lipgloss.NewStyle().Foreground(components.Muted).Render(components.Fit(session.Safe(s.Detail), width-4))
 		}
 		lines = append(lines, m.Zones.Mark(id, style.Render(label)))
 		m.Actions = append([]string{id}, m.Actions...)

@@ -26,7 +26,8 @@ type Store struct {
 	changed         chan struct{}
 	events          [2]map[string]Event
 	sent            [2]map[string]SentMessage
-	names           [2]map[string]string
+	names           [2]map[string]identity
+	serverNames     [2]map[string]serverLabel
 	interned        map[string]string
 	rowCacheMu      sync.Mutex
 	rowCache        map[string]rowCacheEntry
@@ -100,7 +101,16 @@ type Message struct {
 type ChannelObservation struct {
 	ID, Name, Guild, Server, Kind string
 	Title, Recipients             string
-	Rank, ServerRank, KindRank    int
+	Rank, GuildRank               int
+	ServerRank, KindRank          int
+}
+type IdentityObservation struct {
+	Username, GlobalName, Aliases string
+	Rank                          int
+}
+type ServerObservation struct {
+	ID, Name string
+	Rank     int
 }
 type Row struct {
 	ID             string   `json:"message_id"`
@@ -125,11 +135,14 @@ type Row struct {
 	ReportedWords  int      `json:"reported_words"`
 	ReportedURLs   int      `json:"reported_urls"`
 	ReportedFiles  int      `json:"reported_attachments"`
+	NameFallback   bool     `json:"channel_fallback,omitempty"`
+	ServerFallback bool     `json:"server_fallback,omitempty"`
 }
 type Group struct {
 	ID, Name string
 	Count    int
 	Missing  int
+	Fallback bool
 }
 type Filter struct {
 	Mode, Search, Channel, Kind, Media string
@@ -152,13 +165,38 @@ type channel struct {
 	title, recipients         string
 	nameRank, guildRank       int
 	serverRank, kindRank      int
+	titleRank                 int
 	conflict                  bool
+	conflictRank              int
+	privateRank               int
+	dmRank, groupRank         int
+	guildKindRank             int
+}
+
+type identity struct {
+	username, globalName         string
+	usernameRank, globalNameRank int
+	aliases                      string
 }
 
 type serverLabel struct {
 	name  string
 	rank  int
 	count int
+}
+
+type displayValue struct {
+	text     string
+	fallback bool
+}
+
+type serverIdentity struct {
+	id, name string
+}
+
+type serverNameIndex struct {
+	byName map[string]serverIdentity
+	names  []serverIdentity
 }
 
 func New() *Store { return &Store{} }
@@ -185,6 +223,7 @@ func (s *Store) Clear(slot int) {
 	s.events[slot] = nil
 	s.sent[slot] = nil
 	s.names[slot] = nil
+	s.serverNames[slot] = nil
 	s.invalidateRows()
 }
 func (s *Store) Reset(ctx context.Context, slot int) error {
@@ -206,13 +245,14 @@ func (s *Store) Reset(ctx context.Context, slot int) error {
 	s.notifyLocked()
 	s.events[slot] = map[string]Event{}
 	s.sent[slot] = map[string]SentMessage{}
-	s.names[slot] = map[string]string{}
+	s.names[slot] = map[string]identity{}
+	s.serverNames[slot] = map[string]serverLabel{}
 	s.invalidateRows()
 	return nil
 }
 
-// Names records account display names keyed by user ID so group conversations can list their participants.
-func (s *Store) Names(ctx context.Context, slot int, names map[string]string) error {
+// Names records user identities keyed by user ID so conversations can display their participants.
+func (s *Store) Names(ctx context.Context, slot int, names map[string]IdentityObservation) error {
 	if e := ctx.Err(); e != nil {
 		return e
 	}
@@ -221,71 +261,227 @@ func (s *Store) Names(ctx context.Context, slot int, names map[string]string) er
 	if s.names[slot] == nil {
 		return fmt.Errorf("slot is not open")
 	}
-	for id, name := range names {
-		if len(name) > 256 || len(s.names[slot]) >= 1<<16 {
+	for id, observation := range names {
+		if len(observation.Username) > 256 || len(observation.GlobalName) > 256 || len(observation.Aliases) > 4096 || (s.names[slot][id] == identity{} && len(s.names[slot]) >= 1<<16) {
 			continue
 		}
-		s.names[slot][id] = name
+		s.names[slot][id] = mergeIdentity(s.names[slot][id], identityObservation(observation))
 	}
 	s.invalidateRows()
 	return nil
 }
 
-func (s *Store) nameLookupLocked() func(string) string {
-	return func(id string) string {
-		for _, names := range s.names {
-			if name := names[id]; name != "" {
-				return name
-			}
+// ServerNames records server display names independently of channel records.
+func (s *Store) ServerNames(ctx context.Context, slot int, observations []ServerObservation) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.serverNames[slot] == nil {
+		return fmt.Errorf("slot is not open")
+	}
+	for _, observation := range observations {
+		if !digits(observation.ID) || observation.Name == "" || len(observation.Name) > 4096 {
+			continue
 		}
-		return ""
+		candidate := serverLabel{name: observation.Name, rank: observation.Rank, count: 1}
+		current := s.serverNames[slot][observation.ID]
+		if current.name == candidate.name {
+			current.rank = max(current.rank, candidate.rank)
+			current.count++
+			s.serverNames[slot][observation.ID] = current
+		} else if candidate.rank > current.rank || candidate.rank == current.rank && strings.Compare(candidate.name, current.name) < 0 {
+			s.serverNames[slot][observation.ID] = candidate
+		}
+	}
+	s.invalidateRows()
+	return nil
+}
+
+func identityObservation(observation IdentityObservation) identity {
+	value := identity{username: observation.Username, globalName: observation.GlobalName, aliases: observation.Aliases}
+	if value.username != "" {
+		value.usernameRank = observation.Rank
+		value.aliases = mergeRecipientEvidence(value.aliases, value.username)
+	}
+	if value.globalName != "" {
+		value.globalNameRank = observation.Rank
+		value.aliases = mergeRecipientEvidence(value.aliases, value.globalName)
+	}
+	return value
+}
+
+func mergeIdentity(a, b identity) identity {
+	if preferField(a.username, a.usernameRank, b.username, b.usernameRank) {
+		a.username = b.username
+		a.usernameRank = b.usernameRank
+	}
+	if preferField(a.globalName, a.globalNameRank, b.globalName, b.globalNameRank) {
+		a.globalName = b.globalName
+		a.globalNameRank = b.globalNameRank
+	}
+	a.aliases = mergeRecipientEvidence(a.aliases, b.aliases)
+	return a
+}
+
+func identityDisplay(value identity) string {
+	switch {
+	case value.username != "" && value.globalName != "" && !strings.EqualFold(value.username, value.globalName):
+		return "@" + strings.TrimPrefix(value.username, "@") + " (" + value.globalName + ")"
+	case value.username != "":
+		return "@" + strings.TrimPrefix(value.username, "@")
+	default:
+		return value.globalName
 	}
 }
 
-// channelLabel names a channel for display; group conversations list their participants by global name.
-func channelLabel(c channel, id string, lookup func(string) string) string {
-	if c.kind == "dm" || c.kind == "unknown-dm" {
-		if !unresolvedParticipant(c.name) {
-			return c.name
+func (s *Store) identityLookupLocked() func(string) identity {
+	return func(id string) identity {
+		value := s.names[0][id]
+		newer := s.names[1][id]
+		if newer.username != "" {
+			value.username = newer.username
+			value.usernameRank = newer.usernameRank
 		}
+		if newer.globalName != "" {
+			value.globalName = newer.globalName
+			value.globalNameRank = newer.globalNameRank
+		}
+		value.aliases = mergeRecipientEvidence(value.aliases, newer.aliases)
+		return value
+	}
+}
+
+func (s *Store) nameLookupLocked() func(string) string {
+	identityLookup := s.identityLookupLocked()
+	return func(id string) string {
+		return identityDisplay(identityLookup(id))
+	}
+}
+
+// channelLabel names a channel for display using identities resolved from recipient IDs.
+func channelLabel(c channel, id, owner string, lookup func(string) string) string {
+	if c.kind == "dm" || c.kind == "unknown-dm" {
 		for recipient := range strings.SplitSeq(c.recipients, "\n") {
-			name := lookup(recipient)
-			if name == "" && !digits(recipient) {
-				name = recipient
+			if recipient == owner {
+				continue
+			}
+			name := ""
+			if digits(recipient) {
+				name = lookup(recipient)
 			}
 			if !unresolvedParticipant(name) {
-				return "Direct Message with " + name
+				return directLabel(name)
 			}
 		}
-		return cmp.Or(c.name, id)
+		if !unresolvedParticipant(c.name) {
+			return directLabel(c.name)
+		}
+		for recipient := range strings.SplitSeq(c.recipients, "\n") {
+			if recipient == owner {
+				continue
+			}
+			if !digits(recipient) && !unresolvedParticipant(recipient) {
+				return directLabel(recipient)
+			}
+		}
+		return "Unknown participant"
 	}
 	if c.kind != "group" {
 		return cmp.Or(c.name, id)
 	}
-	participants := c.name
-	if participants == "" && c.recipients != "" {
-		var names []string
-		for recipient := range strings.SplitSeq(c.recipients, "\n") {
-			if name := lookup(recipient); name != "" {
-				names = append(names, name)
-			} else if !digits(recipient) && recipient != "" {
-				names = append(names, recipient)
-			}
+	var names []string
+	otherRecipients := 0
+	ownerPresent := false
+	for recipient := range strings.SplitSeq(c.recipients, "\n") {
+		if recipient == "" {
+			continue
 		}
-		participants = strings.Join(names, ", ")
+		if recipient == owner {
+			ownerPresent = true
+			continue
+		}
+		otherRecipients++
+		if name := lookup(recipient); name != "" {
+			names = append(names, name)
+		} else if !digits(recipient) && !unresolvedParticipant(recipient) {
+			names = append(names, directLabel(recipient))
+		}
+	}
+	participants := strings.Join(names, ", ")
+	title := c.title
+	if title == "" && !unresolvedChannelLabel(c.name) {
+		if _, direct := ConversationParticipant(c.name); !direct {
+			title = c.name
+		}
 	}
 	switch {
-	case c.title != "" && participants != "":
-		return c.title + " (" + participants + ")"
-	case c.title != "":
-		return c.title
+	case title != "" && participants != "":
+		return title + " (" + participants + ")"
+	case title != "":
+		return title
 	case participants != "":
 		return participants
+	case ownerPresent && otherRecipients == 0:
+		return "Group DM (only you remain)"
+	case otherRecipients == 1:
+		return "Group DM with 1 unavailable participant"
+	case otherRecipients > 1:
+		return fmt.Sprintf("Group DM with %d unavailable participants", otherRecipients)
 	}
-	if n := strings.Count(c.recipients, "\n") + 1; c.recipients != "" && n > 1 {
-		return fmt.Sprintf("Group of %d", n)
+	return "Unnamed group DM"
+}
+
+func channelDisplay(c channel, id, owner string, lookup func(string) string) displayValue {
+	label := channelLabel(c, id, owner, lookup)
+	fallback := label == "" || label == id || unresolvedChannelLabel(label) || strings.HasPrefix(label, "Group DM with ") || label == "Group DM (only you remain)" || label == "Unnamed group DM"
+	lower := strings.ToLower(strings.TrimSpace(label))
+	if label == "" || label == id || lower == "none" || lower == "null" {
+		label = "Unnamed channel"
+		if suffix := idSuffix(id); suffix != "" {
+			label += " …" + suffix
+		}
 	}
-	return id
+	return displayValue{text: label, fallback: fallback}
+}
+
+func serverDisplay(c channel) displayValue {
+	if c.conflict {
+		return displayValue{text: "Conflicting channel metadata", fallback: true}
+	}
+	switch c.kind {
+	case "dm", "unknown-dm":
+		return displayValue{text: "Direct messages", fallback: true}
+	case "group":
+		return displayValue{text: "Group messages", fallback: true}
+	}
+	if c.server != "" && !unresolvedChannelLabel(c.server) {
+		return displayValue{text: c.server}
+	}
+	label := "Unknown server"
+	if suffix := idSuffix(c.guild); suffix != "" {
+		label += " …" + suffix
+	}
+	return displayValue{text: label, fallback: true}
+}
+
+func idSuffix(id string) string {
+	if len(id) <= 4 {
+		return id
+	}
+	return id[len(id)-4:]
+}
+
+func directLabel(name string) string {
+	name = strings.TrimSpace(name)
+	if participant, ok := ConversationParticipant(name); ok {
+		name = participant
+	}
+	if head, tail, ok := strings.Cut(name, "#"); ok && tail != "" && strings.Trim(tail, "0123456789") == "" {
+		name = head
+	}
+	return "@" + strings.TrimPrefix(name, "@")
 }
 
 func unresolvedParticipant(name string) bool {
@@ -293,8 +489,49 @@ func unresolvedParticipant(name string) bool {
 	return name == "" || strings.Contains(name, "unknown participant") || name == "deleted user" || strings.HasSuffix(name, "with deleted user")
 }
 
+// ConversationParticipant extracts the participant from Discord's direct-message labels.
+func ConversationParticipant(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"direct message with ", "direct messages with "} {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(value[len(prefix):]), true
+		}
+	}
+	if participant, ok := strings.CutPrefix(value, "@"); ok && strings.TrimSpace(participant) != "" {
+		return strings.TrimSpace(participant), true
+	}
+	return "", false
+}
+
+// ClassifyChannelLabel interprets labels shared by Messages/index.json and Activity records.
+func ClassifyChannelLabel(value string) (string, string, string) {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	if participant, ok := ConversationParticipant(value); ok {
+		if unresolvedParticipant(participant) {
+			return value, "", "unknown-dm"
+		}
+		return value, "", "dm"
+	}
+	if i := strings.LastIndex(lower, " in "); i >= 0 {
+		return value[:i], value[i+4:], "guild"
+	}
+	if strings.HasPrefix(lower, "unknown channel, ") {
+		return "Unknown channel", value[len("Unknown channel, "):], "guild"
+	}
+	if strings.EqualFold(value, "None") || value == "" {
+		return "", "", "unknown"
+	}
+	return value, "", "unknown"
+}
+
 func digits(v string) bool {
 	if v == "" {
+		return false
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || n == 0 {
 		return false
 	}
 	for _, r := range v {
@@ -402,7 +639,7 @@ func sentChannel(sent SentMessage) channel {
 		kind = "guild"
 		rank = 2
 	}
-	return channelObservation("", sent.Guild, "", kind, "", "", rank)
+	return channelObservation("", sent.Guild, "", kind, "", "", rank, rank)
 }
 
 // SentMessages merges repeated send_message records from Activity files by message ID.
@@ -540,23 +777,24 @@ func (s *Store) WaitMessages(ctx context.Context) error {
 	}
 }
 func merge(a, b channel) channel {
-	a.conflict = a.conflict || b.conflict || (a.guild != "" && b.guild != "" && a.guild != b.guild)
+	a = mergeGuildEvidence(a, b)
+	a.privateRank = max(a.privateRank, b.privateRank)
+	a.dmRank = max(a.dmRank, b.dmRank)
+	a.groupRank = max(a.groupRank, b.groupRank)
+	a.guildKindRank = max(a.guildKindRank, b.guildKindRank)
 	if preferChannelName(a.name, a.nameRank, b.name, b.nameRank) {
 		a.name = b.name
 		a.nameRank = b.nameRank
 	}
-	if preferField(a.guild, a.guildRank, b.guild, b.guildRank) {
-		a.guild = b.guild
-		a.guildRank = b.guildRank
-	}
-	if preferField(a.server, a.serverRank, b.server, b.serverRank) {
+	if preferDisplayField(a.server, a.serverRank, b.server, b.serverRank) {
 		a.server = b.server
 		a.serverRank = b.serverRank
 	}
-	a.title = cmp.Or(a.title, b.title)
-	if len(b.recipients) > len(a.recipients) {
-		a.recipients = b.recipients
+	if preferDisplayField(a.title, a.titleRank, b.title, b.titleRank) {
+		a.title = b.title
+		a.titleRank = b.titleRank
 	}
+	a.recipients = mergeRecipientEvidence(a.recipients, b.recipients)
 	if a.kind == "dm" && b.kind == "unknown-dm" || a.kind == "unknown-dm" && b.kind == "dm" {
 		a.kind = "dm"
 		a.kindRank = max(a.kindRank, b.kindRank)
@@ -564,24 +802,172 @@ func merge(a, b channel) channel {
 		a.kind = b.kind
 		a.kindRank = b.kindRank
 	}
+	return resolveChannelEvidence(a)
+}
+
+func mergeGuildEvidence(a, b channel) channel {
+	if b.guild == "" {
+		return a
+	}
+	if a.guild == "" || b.guildRank > a.guildRank {
+		a.guild = b.guild
+		a.guildRank = b.guildRank
+		a.conflict = b.conflict
+		a.conflictRank = b.conflictRank
+		return a
+	}
+	if b.guildRank < a.guildRank {
+		return a
+	}
+	if a.guild == b.guild {
+		if a.conflictRank < a.guildRank {
+			a.conflict = false
+			a.conflictRank = 0
+		}
+		if b.conflict && b.conflictRank >= a.guildRank {
+			a.conflict = true
+			a.conflictRank = b.conflictRank
+		}
+		return a
+	}
+	if strings.Compare(b.guild, a.guild) < 0 {
+		a.guild = b.guild
+	}
+	a.conflict = true
+	a.conflictRank = a.guildRank
 	return a
 }
 
+func resolveChannelEvidence(c channel) channel {
+	privateKindRank := max(c.privateRank, c.dmRank, c.groupRank)
+	if c.guildKindRank > privateKindRank {
+		c.kind = "guild"
+		c.kindRank = c.guildKindRank
+		return c
+	}
+	if c.guildKindRank > 0 && c.guildKindRank == privateKindRank {
+		c.kind = "conflict"
+		c.kindRank = c.guildKindRank
+		c.conflict = true
+		c.conflictRank = c.guildKindRank
+		return c
+	}
+	if privateKindRank > 0 {
+		c.guild = ""
+		c.server = ""
+		c.conflict = false
+		c.conflictRank = 0
+	}
+	if c.groupRank > c.dmRank {
+		c.kind = "group"
+		c.kindRank = c.groupRank
+		return c
+	}
+	if c.dmRank > c.groupRank {
+		c.kind = "dm"
+		c.kindRank = c.dmRank
+		return c
+	}
+	if c.dmRank > 0 {
+		c.kind = "conflict"
+		c.kindRank = c.dmRank
+		c.conflict = true
+		c.conflictRank = c.dmRank
+		return c
+	}
+	if c.privateRank > 0 {
+		c.kind = "unknown-dm"
+		c.kindRank = c.privateRank
+		return c
+	}
+	if c.kind == "unknown" {
+		c.kind = ""
+		c.kindRank = 0
+	}
+	if c.kind == "" && c.guild != "" {
+		c.kind = "guild"
+		c.kindRank = c.guildRank
+	}
+	return c
+}
+
+func mergeRecipientEvidence(a, b string) string {
+	if b == "" || a == b {
+		return a
+	}
+	if a == "" {
+		return b
+	}
+	values := map[string]bool{}
+	for value := range strings.SplitSeq(a+"\n"+b, "\n") {
+		if value = strings.TrimSpace(value); value != "" {
+			values[value] = true
+		}
+	}
+	items := slices.Sorted(maps.Keys(values))
+	var out strings.Builder
+	for _, item := range items {
+		added := len(item)
+		if out.Len() > 0 {
+			added++
+		}
+		if out.Len()+added > 4096 {
+			break
+		}
+		if out.Len() > 0 {
+			out.WriteByte('\n')
+		}
+		out.WriteString(item)
+	}
+	return out.String()
+}
+
 func preferChannelName(current string, currentRank int, candidate string, candidateRank int) bool {
-	currentUnknown := unresolvedParticipant(current)
-	candidateUnknown := unresolvedParticipant(candidate)
+	currentUnknown := unresolvedChannelLabel(current)
+	candidateUnknown := unresolvedChannelLabel(candidate)
 	if current != "" && candidate != "" && currentUnknown != candidateUnknown {
 		return currentUnknown
 	}
 	return preferField(current, currentRank, candidate, candidateRank)
 }
 
+func preferDisplayField(current string, currentRank int, candidate string, candidateRank int) bool {
+	currentUnknown := unresolvedChannelLabel(current)
+	candidateUnknown := unresolvedChannelLabel(candidate)
+	if current != "" && candidate != "" && currentUnknown != candidateUnknown {
+		return currentUnknown
+	}
+	return preferField(current, currentRank, candidate, candidateRank)
+}
+
+func unresolvedChannelLabel(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return unresolvedParticipant(value) || value == "none" || value == "null" || strings.HasPrefix(value, "unknown channel") || strings.HasPrefix(value, "unnamed channel") || strings.HasPrefix(value, "unknown server")
+}
+
 func preferField(current string, currentRank int, candidate string, candidateRank int) bool {
 	return candidate != "" && (current == "" || candidateRank > currentRank || candidateRank == currentRank && strings.Compare(candidate, current) < 0)
 }
 
-func channelObservation(name, guild, server, kind, title, recipients string, rank int) channel {
+func channelObservation(name, guild, server, kind, title, recipients string, rank, kindRank int) channel {
+	_, _, labelKind := ClassifyChannelLabel(name)
+	labelPrivate := guild == "" && kind != "guild" && (labelKind == "dm" || labelKind == "unknown-dm")
 	c := channel{name: name, guild: guild, server: server, kind: kind, title: title, recipients: recipients}
+	if labelPrivate {
+		c.privateRank = rank
+	}
+	if kind == "dm" || kind == "unknown-dm" || kind == "group" {
+		c.privateRank = max(c.privateRank, kindRank)
+	}
+	if kind == "dm" || labelPrivate && labelKind == "dm" {
+		c.dmRank = kindRank
+	}
+	if kind == "group" {
+		c.groupRank = kindRank
+	}
+	if kind == "guild" {
+		c.guildKindRank = kindRank
+	}
 	if name != "" {
 		c.nameRank = rank
 	}
@@ -592,7 +978,10 @@ func channelObservation(name, guild, server, kind, title, recipients string, ran
 		c.serverRank = rank
 	}
 	if kind != "" {
-		c.kindRank = rank
+		c.kindRank = kindRank
+	}
+	if title != "" {
+		c.titleRank = rank
 	}
 	return c
 }
@@ -602,10 +991,15 @@ func sameOwner(a, b *Snapshot) bool {
 }
 
 func (s *Store) effectiveChannelsLocked(combine bool) []channel {
+	index := s.serverNameIndexLocked(combine)
 	if !combine {
-		out := make([]channel, 0, len(s.channels[0])+len(s.channels[1]))
-		for _, channels := range s.channels {
-			out = append(out, slices.Collect(maps.Values(channels))...)
+		slot := 1
+		if s.snapshots[0] != nil {
+			slot = 0
+		}
+		out := slices.Collect(maps.Values(s.channels[slot]))
+		for i := range out {
+			out[i] = resolveChannelServer(out[i], index)
 		}
 		return out
 	}
@@ -615,10 +1009,79 @@ func (s *Store) effectiveChannelsLocked(combine bool) []channel {
 			byID[id] = merge(byID[id], c)
 		}
 	}
-	return slices.Collect(maps.Values(byID))
+	out := slices.Collect(maps.Values(byID))
+	for i := range out {
+		out[i] = resolveChannelServer(out[i], index)
+	}
+	return out
 }
 
-func serverLabels(channels []channel) map[string]serverLabel {
+func (s *Store) includeSlotLocked(combine bool, slot int) bool {
+	return combine || s.snapshots[0] != nil && slot == 0 || s.snapshots[0] == nil && slot == 1
+}
+
+func (s *Store) serverNameIndexLocked(combine bool) serverNameIndex {
+	index := serverNameIndex{byName: map[string]serverIdentity{}}
+	add := func(id, name string) {
+		name = strings.TrimSpace(name)
+		if !digits(id) || name == "" || unresolvedChannelLabel(name) {
+			return
+		}
+		key := strings.ToLower(name)
+		current, exists := index.byName[key]
+		if exists && current.id != id {
+			index.byName[key] = serverIdentity{name: name}
+			return
+		}
+		index.byName[key] = serverIdentity{id: id, name: name}
+	}
+	for slot := range 2 {
+		if !s.includeSlotLocked(combine, slot) {
+			continue
+		}
+		for id, label := range s.serverNames[slot] {
+			add(id, label.name)
+		}
+		for _, c := range s.channels[slot] {
+			add(c.guild, c.server)
+		}
+	}
+	for _, identity := range index.byName {
+		if identity.id != "" {
+			index.names = append(index.names, identity)
+		}
+	}
+	slices.SortFunc(index.names, func(a, b serverIdentity) int {
+		return cmp.Or(cmp.Compare(len(b.name), len(a.name)), strings.Compare(a.name, b.name), strings.Compare(a.id, b.id))
+	})
+	return index
+}
+
+func resolveChannelServer(c channel, index serverNameIndex) channel {
+	if c.guild != "" || c.kind == "dm" || c.kind == "unknown-dm" || c.kind == "group" || c.server == "" {
+		return c
+	}
+	full := strings.TrimSpace(c.name + " in " + c.server)
+	identity := index.byName[strings.ToLower(strings.TrimSpace(c.server))]
+	if identity.id == "" {
+		for _, candidate := range index.names {
+			suffix := " in " + candidate.name
+			if len(full) >= len(suffix) && strings.EqualFold(full[len(full)-len(suffix):], suffix) {
+				identity = candidate
+				c.name = strings.TrimSpace(full[:len(full)-len(suffix)])
+				break
+			}
+		}
+	}
+	if identity.id != "" {
+		c.guild = identity.id
+		c.guildRank = max(c.guildRank, c.serverRank)
+		c.server = identity.name
+	}
+	return c
+}
+
+func (s *Store) serverLabelsLocked(channels []channel, combine bool) map[string]serverLabel {
 	candidates := map[string]map[string]serverLabel{}
 	for _, c := range channels {
 		if c.guild == "" || c.server == "" || c.conflict {
@@ -632,6 +1095,24 @@ func serverLabels(channels []channel) map[string]serverLabel {
 		label.rank = max(label.rank, c.serverRank)
 		label.count++
 		candidates[c.guild][c.server] = label
+	}
+	for slot, names := range s.serverNames {
+		if !s.includeSlotLocked(combine, slot) {
+			continue
+		}
+		for guild, observed := range names {
+			if observed.name == "" {
+				continue
+			}
+			if candidates[guild] == nil {
+				candidates[guild] = map[string]serverLabel{}
+			}
+			candidate := candidates[guild][observed.name]
+			candidate.name = observed.name
+			candidate.rank = max(candidate.rank, observed.rank)
+			candidate.count += observed.count
+			candidates[guild][observed.name] = candidate
+		}
 	}
 	labels := make(map[string]serverLabel, len(candidates))
 	for guild, names := range candidates {
@@ -670,12 +1151,16 @@ func (s *Store) Channels(ctx context.Context, slot int, observations []ChannelOb
 		if observation.ID == "" {
 			continue
 		}
-		candidate := channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank)
+		kindRank := observation.Rank
+		if observation.Kind != "" && observation.KindRank > 0 {
+			kindRank = observation.KindRank
+		}
+		candidate := channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank, kindRank)
+		if observation.Guild != "" && observation.GuildRank > 0 {
+			candidate.guildRank = observation.GuildRank
+		}
 		if observation.Server != "" && observation.ServerRank > 0 {
 			candidate.serverRank = observation.ServerRank
-		}
-		if observation.Kind != "" && observation.KindRank > 0 {
-			candidate.kindRank = observation.KindRank
 		}
 		s.channels[slot][observation.ID] = merge(s.channels[slot][observation.ID], candidate)
 	}
@@ -919,13 +1404,14 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	a, b := s.snapshots[0], s.snapshots[1]
 	ok, why := compatible(a, b)
 	same := sameOwner(a, b)
-	labels := serverLabels(s.effectiveChannelsLocked(same))
+	labels := s.serverLabelsLocked(s.effectiveChannelsLocked(same), same)
+	serverIndex := s.serverNameIndexLocked(same)
 	lookup := s.nameLookupLocked()
 	for i, token := range query.Tokens {
 		if token.Key == "mentions" && !digits(token.Value) {
 			for _, names := range s.names {
-				for id, name := range names {
-					if searchEqual(token.Value, name) {
+				for id, person := range names {
+					if identitySearchEqual(token.Value, person) {
 						query.Tokens[i].Value = id
 					}
 				}
@@ -954,7 +1440,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	}
 	type resolvedChannel struct {
 		channel channel
-		name    string
+		name    displayValue
 		allowed bool
 	}
 	type channelKey struct{ id, guild, kind string }
@@ -1110,17 +1596,18 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				if same {
 					c = merge(s.channels[0][m.Channel], s.channels[1][m.Channel])
 				}
+				c = resolveChannelServer(c, serverIndex)
 				c = applyServerLabel(merge(c, sentChannel(sent)), labels)
-				name := channelLabel(c, m.Channel, lookup)
 				owner := ""
 				if s.snapshots[slot] != nil {
 					owner = s.snapshots[slot].Owner
 				}
+				name := channelDisplay(c, m.Channel, owner, lookup)
 				guild := c.guild
 				if c.conflict {
 					guild = ""
 				}
-				allowed := (len(f.Guilds) == 0 || slices.Contains(f.Guilds, guild)) && !slices.Contains(f.ExcludedGuilds, guild) && (f.Kind == "" || f.Kind == c.kind) && query.channelMatches(c, m.Channel, name, owner, lookup)
+				allowed := (len(f.Guilds) == 0 || slices.Contains(f.Guilds, guild)) && !slices.Contains(f.ExcludedGuilds, guild) && (f.Kind == "" || f.Kind == c.kind) && query.channelMatches(c, m.Channel, name.text, owner, lookup)
 				resolved = &resolvedChannel{c, name, allowed}
 				resolvedChannels[key] = resolved
 			}
@@ -1161,17 +1648,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 			c.guild = ""
 			c.kind = "conflict"
 		}
-		server := c.server
-		if server == "" {
-			switch c.kind {
-			case "dm", "unknown-dm":
-				server = "Direct messages"
-			case "group":
-				server = "Group messages"
-			default:
-				server = "Unknown server"
-			}
-		}
+		server := serverDisplay(c)
 		status := "observed"
 		if v.missing {
 			status = "missing"
@@ -1186,7 +1663,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		if !v.sent.Time.IsZero() {
 			sendTime = v.sent.Time.Format(time.RFC3339Nano)
 		}
-		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server, Name: v.c.name, Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs), MessageRecord: v.messageRecord, SendEvent: v.sent.ID != "", Sources: sourceNames(v.sent.Sources, v.messageRecord), SendEventID: v.sent.EventID, SendTime: sendTime, Platform: v.sent.Platform, ReportedLength: v.sent.Length, ReportedWords: v.sent.Words, ReportedURLs: v.sent.URLs, ReportedFiles: v.sent.Attachments})
+		rows = append(rows, Row{ID: m.ID, Channel: m.Channel, Date: m.Date, Content: m.Content, Guild: c.guild, Server: server.text, Name: v.c.name.text, Kind: cmp.Or(c.kind, "unknown"), Status: status, HasAttachments: m.HasAttachments, HasMedia: m.HasMedia, AttachmentURLs: slices.Clone(m.AttachmentURLs), MessageRecord: v.messageRecord, SendEvent: v.sent.ID != "", Sources: sourceNames(v.sent.Sources, v.messageRecord), SendEventID: v.sent.EventID, SendTime: sendTime, Platform: v.sent.Platform, ReportedLength: v.sent.Length, ReportedWords: v.sent.Words, ReportedURLs: v.sent.URLs, ReportedFiles: v.sent.Attachments, NameFallback: v.c.name.fallback, ServerFallback: server.fallback})
 	}
 	s.cacheRows(cacheKey, cacheVersion, rows, now)
 	return pageRows(rows, offset, limit), nil
@@ -1216,19 +1693,27 @@ func (s *Store) Groups(ctx context.Context, f Filter, dates bool) ([]Group, erro
 	return GroupRows(rows, dates), nil
 }
 func GroupRows(rows []Row, dates bool) []Group {
-	counts := map[[2]string]int{}
+	groups := map[[2]string]Group{}
 	for _, r := range rows {
 		key := [2]string{r.Guild, r.Server}
+		fallback := r.ServerFallback
 		if dates {
 			day := LocalDate(r.Date)
 			key = [2]string{day, day}
+			fallback = false
 		}
-		counts[key]++
+		group := groups[key]
+		group.ID = key[0]
+		group.Name = key[1]
+		if group.Count == 0 {
+			group.Fallback = fallback
+		} else {
+			group.Fallback = group.Fallback && fallback
+		}
+		group.Count++
+		groups[key] = group
 	}
-	out := make([]Group, 0, len(counts))
-	for k, n := range counts {
-		out = append(out, Group{ID: k[0], Name: k[1], Count: n})
-	}
+	out := slices.Collect(maps.Values(groups))
 	slices.SortFunc(out, func(a, b Group) int {
 		return cmp.Or(cmp.Compare(b.Count, a.Count), strings.Compare(a.ID, b.ID), strings.Compare(a.Name, b.Name))
 	})
@@ -1237,15 +1722,37 @@ func GroupRows(rows []Row, dates bool) []Group {
 func (s *Store) Servers(ctx context.Context) ([]Group, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	channels := s.effectiveChannelsLocked(sameOwner(s.snapshots[0], s.snapshots[1]))
-	labels := serverLabels(channels)
+	combine := sameOwner(s.snapshots[0], s.snapshots[1])
+	allChannels := s.effectiveChannelsLocked(combine)
+	labels := s.serverLabelsLocked(allChannels, combine)
+	index := s.serverNameIndexLocked(combine)
+	active := map[string]bool{}
+	for slot := range 2 {
+		if !s.includeSlotLocked(combine, slot) {
+			continue
+		}
+		for id := range s.recent[slot] {
+			active[id] = true
+		}
+	}
+	channels := make([]channel, 0, len(active))
+	for id := range active {
+		var c channel
+		for slot := range 2 {
+			if s.includeSlotLocked(combine, slot) {
+				c = merge(c, s.channels[slot][id])
+			}
+		}
+		channels = append(channels, resolveChannelServer(c, index))
+	}
 	groups := map[string]Group{}
 	for _, c := range channels {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if c.guild != "" && !c.conflict {
-			groups[c.guild] = Group{ID: c.guild, Name: cmp.Or(labels[c.guild].name, c.guild)}
+			display := serverDisplay(applyServerLabel(c, labels))
+			groups[c.guild] = Group{ID: c.guild, Name: display.text, Fallback: display.fallback}
 		}
 	}
 	out := slices.Collect(maps.Values(groups))

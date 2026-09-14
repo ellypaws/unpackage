@@ -23,6 +23,7 @@ var eventKinds = map[string]store.EventKind{
 
 type activityFacts struct {
 	Channel store.ChannelObservation
+	Server  store.ServerObservation
 	Event   store.Event
 	Sent    store.SentMessage
 }
@@ -80,32 +81,47 @@ func activityCount(v string) int {
 
 func activityRecord(m map[string]string, source store.ActivitySource) activityFacts {
 	channel, guild := activityChannel(m)
-	kind := channelKind(m["channel_type"], guild)
+	eventType := m["event_type"]
+	kind := channelKind(m["channel_type"], "")
 	structuredKind := kind != ""
-	kindRank := 2
+	kindRank := 0
+	if structuredKind {
+		kindRank = 2
+	}
 	name := m["channel_name"]
 	server := m["guild_name"]
 	serverRank := 2
+	channelGuild := ""
+	channelServer := ""
+	guildRank := 0
+	if eventType == "send_message" {
+		channelGuild = guild
+		channelServer = server
+		guildRank = 2
+	}
 	title := ""
 	recipients := cmp.Or(m["recipient_ids"], m["recipients"])
 	if kind == "" && name != "" {
-		_, inferredServer, inferredKind := label(name)
+		_, inferredServer, inferredKind := store.ClassifyChannelLabel(name)
 		if inferredKind != "unknown" {
 			kind = inferredKind
 			kindRank = 1
-			if server == "" && inferredServer != "" {
-				server = inferredServer
+			if channelServer == "" && inferredServer != "" {
+				channelServer = inferredServer
 				serverRank = 1
 			}
 		}
 	}
 	if !structuredKind && strings.EqualFold(m["private"], "true") {
-		switch {
-		case strings.Contains(recipients, "\n"):
-			kind = "group"
-			kindRank = 2
-		case kind == "" || kind == "unknown-dm":
+		if kind == "" || kind == "unknown-dm" {
 			kind = "unknown-dm"
+			kindRank = 2
+		}
+	}
+	if kind == "" && channelGuild != "" {
+		kind = "guild"
+		kindRank = 1
+		if strings.EqualFold(m["private"], "false") {
 			kindRank = 2
 		}
 	}
@@ -114,12 +130,15 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 		name = ""
 	}
 	facts := activityFacts{}
-	if channel != "" && (name != "" || guild != "" || server != "" || kind != "" || title != "" || recipients != "") {
-		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: guild, Server: server, Kind: kind, Title: title, Recipients: recipients, Rank: 2, ServerRank: serverRank, KindRank: kindRank}
+	if channel != "" && (name != "" || channelGuild != "" || channelServer != "" || kind != "" || title != "" || recipients != "") {
+		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: channelGuild, Server: channelServer, Kind: kind, Title: title, Recipients: recipients, Rank: 2, GuildRank: guildRank, ServerRank: serverRank, KindRank: kindRank}
+	}
+	if guild != "" && server != "" {
+		facts.Server = store.ServerObservation{ID: guild, Name: server, Rank: serverRank}
 	}
 
-	eventKind := eventKinds[m["event_type"]]
-	if eventKind == 0 && m["event_type"] != "send_message" {
+	eventKind := eventKinds[eventType]
+	if eventKind == 0 && eventType != "send_message" {
 		return facts
 	}
 	at, hasTime := eventTime(m["timestamp"])
@@ -127,7 +146,7 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 	if eventKind != 0 && hasTime {
 		e := store.Event{ID: m["event_id"], Kind: eventKind, Time: at, Guild: guild, Channel: channel, Platform: client}
 		if e.ID == "" {
-			e.ID = m["event_type"] + "\x00" + m["timestamp"] + "\x00" + channel
+			e.ID = eventType + "\x00" + m["timestamp"] + "\x00" + channel
 		}
 		switch eventKind {
 		case store.EventVoice:
@@ -153,7 +172,7 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 		}
 	}
 
-	if m["event_type"] == "send_message" && digits(m["message_id"]) {
+	if eventType == "send_message" && digits(m["message_id"]) {
 		eventID := m["event_id"]
 		if len(eventID) > 1024 {
 			eventID = ""

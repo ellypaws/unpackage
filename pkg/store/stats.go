@@ -104,6 +104,9 @@ func (f StatsFilter) admitsEvent(e Event) bool {
 type Leader struct {
 	ID, Name, Kind string
 	Parent         string
+	ParentName     string
+	Fallback       bool
+	ParentFallback bool
 	Values         [MetricCount]int
 	Lifetime       int
 }
@@ -153,11 +156,11 @@ func SortLeaders(leaders []Leader, by Metric) {
 
 type board map[string]*Leader
 
-func (b board) get(id, name, kind string) *Leader {
+func (b board) get(id, name, kind string, fallback bool) *Leader {
 	if l := b[id]; l != nil {
 		return l
 	}
-	l := &Leader{ID: id, Name: name, Kind: kind}
+	l := &Leader{ID: id, Name: name, Kind: kind, Fallback: fallback}
 	b[id] = l
 	return l
 }
@@ -309,12 +312,14 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 		view.events[slot] = maps.Clone(s.events[slot])
 		view.channels[slot] = maps.Clone(s.channels[slot])
 		view.names[slot] = maps.Clone(s.names[slot])
+		view.serverNames[slot] = maps.Clone(s.serverNames[slot])
 	}
 	s.mu.RUnlock()
 	s = view
 	a, b := s.snapshots[0], s.snapshots[1]
 	same := sameOwner(a, b)
 	comparable, _ := compatible(a, b)
+	serverIndex := s.serverNameIndexLocked(same)
 	channels := make(map[string]channel, len(s.channels[0])+len(s.channels[1]))
 	for slot, cs := range s.channels {
 		if !same && (a != nil && slot != 0 || a == nil && slot != 1) {
@@ -324,8 +329,17 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			channels[id] = merge(channels[id], c)
 		}
 	}
-	labels := serverLabels(slices.Collect(maps.Values(channels)))
+	for id, c := range channels {
+		channels[id] = resolveChannelServer(c, serverIndex)
+	}
+	labels := s.serverLabelsLocked(slices.Collect(maps.Values(channels)), same)
 	lookup := s.nameLookupLocked()
+	owner := ""
+	if a != nil {
+		owner = a.Owner
+	} else if b != nil {
+		owner = b.Owner
+	}
 	for id, c := range channels {
 		c = applyServerLabel(c, labels)
 		if c.conflict {
@@ -351,29 +365,34 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 		st.Monthly[i] = map[string]int{}
 	}
 	servers, chans, people, games, platforms, emoji := board{}, board{}, board{}, board{}, board{}, board{}
-	serverName := func(guild string) string { return cmp.Or(labels[guild].name, guild) }
+	serverName := func(guild string) displayValue {
+		return serverDisplay(channel{guild: guild, server: labels[guild].name, kind: "guild"})
+	}
 	channelBoards := func(c channel, guild, id string) []*Leader {
 		out := make([]*Leader, 0, 3)
 		conversation := c.kind == "dm" || c.kind == "unknown-dm" || c.kind == "group"
 		if conversation {
 			if id != "" {
-				out = append(out, people.get(id, channelLabel(c, id, lookup), c.kind))
+				display := channelDisplay(c, id, owner, lookup)
+				out = append(out, people.get(id, display.text, c.kind, display.fallback))
 			}
 			return out
 		}
 		if guild != "" {
-			out = append(out, servers.get(guild, serverName(guild), "server"))
+			display := serverName(guild)
+			out = append(out, servers.get(guild, display.text, "server", display.fallback))
 		}
 		if id != "" {
-			label := channelLabel(c, id, lookup)
-			if label == id {
-				label = "unnamed channel …" + id[max(0, len(id)-4):]
-			}
+			display := channelDisplay(c, id, owner, lookup)
+			label := display.text
+			parent := displayValue{}
 			if guild != "" {
-				label = serverName(guild) + " / " + label
+				parent = serverName(guild)
 			}
-			ch := chans.get(id, label, cmp.Or(c.kind, "unknown"))
+			ch := chans.get(id, label, cmp.Or(c.kind, "unknown"), display.fallback)
 			ch.Parent = guild
+			ch.ParentName = parent.text
+			ch.ParentFallback = parent.fallback
 			out = append(out, ch)
 		}
 		return out
@@ -486,7 +505,10 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			}
 			seen[id] = true
 			c := channels[e.Channel]
-			guild := cmp.Or(e.Guild, c.guild)
+			guild := cmp.Or(c.guild, e.Guild)
+			if c.kind == "dm" || c.kind == "unknown-dm" || c.kind == "group" {
+				guild = ""
+			}
 			if !matchesGuild(guild) || !f.admitsEvent(e) {
 				continue
 			}
@@ -494,7 +516,7 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 			st.observe(t)
 			var platform *Leader
 			if e.Platform != "" {
-				platform = platforms.get(e.Platform, e.Platform, "platform")
+				platform = platforms.get(e.Platform, e.Platform, "platform", false)
 			}
 			switch e.Kind {
 			case EventVoiceJoin:
@@ -524,7 +546,7 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 				if e.Name == "" {
 					continue
 				}
-				game := games.get(e.Name, e.Name, "game")
+				game := games.get(e.Name, e.Name, "game", false)
 				game.Lifetime = max(game.Lifetime, int(e.Total/time.Second))
 				if f.contains(t) {
 					game.Values[MetricSessions]++
@@ -550,7 +572,7 @@ func (s *Store) Stats(ctx context.Context, f StatsFilter) (*Stats, error) {
 					l.Values[MetricReactions]++
 				}
 				if e.Name != "" {
-					emoji.get(e.Name, e.Name, "emoji").Values[MetricReactions]++
+					emoji.get(e.Name, e.Name, "emoji", false).Values[MetricReactions]++
 				}
 			case EventGuildJoin:
 				if f.contains(t) {

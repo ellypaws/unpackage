@@ -2,6 +2,7 @@ package importer
 
 import (
 	"archive/zip"
+	"cmp"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -22,9 +23,9 @@ import (
 )
 
 type file struct {
-	name, channel string
-	size          int64
-	category      int
+	name, channel, guild string
+	size                 int64
+	category             int
 }
 
 func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan struct{}, logger *slog.Logger) (ret error) {
@@ -148,6 +149,18 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			if part == "activity" && strings.HasSuffix(lower, ".json") {
 				cat = 4
 			}
+			if part == "servers" {
+				if i+1 == len(parts)-1 && parts[i+1] == "index.json" {
+					cat = 5
+					cid = ""
+				} else if i+2 == len(parts)-1 {
+					gid := parts[i+1]
+					if digits(gid) && (parts[i+2] == "guild.json" || parts[i+2] == "channels.json") {
+						cat = 5
+						cid = ""
+					}
+				}
+			}
 		}
 		if cat < 0 {
 			return nil
@@ -156,7 +169,16 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		if e != nil {
 			return e
 		}
-		files = append(files, file{p, cid, inf.Size(), cat})
+		gid := ""
+		if cat == 5 {
+			for i, part := range parts {
+				if part == "servers" && i+1 < len(parts) {
+					gid = parts[i+1]
+					break
+				}
+			}
+		}
+		files = append(files, file{name: p, channel: cid, guild: gid, size: inf.Size(), category: cat})
 		total += inf.Size()
 		return nil
 	})
@@ -189,7 +211,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			jsonDirs[path.Dir(f.name)] = true
 		}
 	}
-	var stages [5][]file
+	var stages [6][]file
 	for _, f := range files {
 		if f.category == 3 && strings.HasSuffix(strings.ToLower(f.name), ".csv") && jsonDirs[path.Dir(f.name)] {
 			processed.Add(f.size)
@@ -208,9 +230,18 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		var metadata []store.ChannelObservation
 		var events []store.Event
 		var sentMessages []store.SentMessage
-		var names map[string]string
-		var lastNameID, lastName string
+		var serverNames []store.ServerObservation
+		var names map[string]store.IdentityObservation
+		var lastNameID, lastUsername, lastGlobalName string
+		identityRank := 1
+		if f.category == 0 {
+			identityRank = 3
+		} else if f.category == 2 {
+			identityRank = 2
+		}
+		identityRank = sourcePriority(identityRank, slot)
 		observations := map[store.ChannelObservation]bool{}
+		serverObservations := map[store.ServerObservation]bool{}
 		activityOrigin := store.ActivityOther
 		if f.category == 4 {
 			activityOrigin = activitySource(f.name)
@@ -258,32 +289,57 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			}
 			return e
 		}
+		flushServerNames := func() error {
+			if len(serverNames) == 0 {
+				return nil
+			}
+			e := s.ServerNames(ctx, slot, serverNames)
+			if e == nil {
+				serverNames = serverNames[:0]
+			}
+			return e
+		}
+		collectServer := func(observation store.ServerObservation) error {
+			if observation.ID == "" || observation.Name == "" || serverObservations[observation] {
+				return nil
+			}
+			if len(serverObservations) >= 16384 {
+				clear(serverObservations)
+			}
+			serverObservations[observation] = true
+			serverNames = append(serverNames, observation)
+			if len(serverNames) >= 512 {
+				return flushServerNames()
+			}
+			return nil
+		}
 		collectName := func(m map[string]string) error {
 			id := m["id"]
 			if id == "" {
 				return nil
 			}
-			name := m["global_name"]
-			global := name != ""
-			if name == "" {
-				name = m["username"]
-			}
-			if name == "" || (id == lastNameID && name == lastName) {
+			username, globalName := m["username"], m["global_name"]
+			if (username == "" && globalName == "") || (id == lastNameID && username == lastUsername && globalName == lastGlobalName) {
 				return nil
 			}
 			current := names[id]
-			if (!global && current != "") || current == name {
-				lastNameID, lastName = id, name
-				return nil
-			}
-			if !digits(id) || (current == "" && len(names) >= 1<<16) {
+			if !digits(id) || (current == (store.IdentityObservation{}) && len(names) >= 1<<16) {
 				return nil
 			}
 			if names == nil {
-				names = make(map[string]string)
+				names = make(map[string]store.IdentityObservation)
 			}
-			names[id] = name
-			lastNameID, lastName = id, name
+			if username != "" {
+				current.Username = username
+				current.Aliases = addIdentityAlias(current.Aliases, username)
+			}
+			if globalName != "" {
+				current.GlobalName = globalName
+				current.Aliases = addIdentityAlias(current.Aliases, globalName)
+			}
+			current.Rank = identityRank
+			names[id] = current
+			lastNameID, lastUsername, lastGlobalName = id, username, globalName
 			return nil
 		}
 		progress := func() error {
@@ -305,6 +361,9 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 				return e
 			}
 			if e := flushSentMessages(); e != nil {
+				return e
+			}
+			if e := flushServerNames(); e != nil {
 				return e
 			}
 			publish(phase, false)
@@ -336,18 +395,12 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					gid = m["guild"]
 				}
 				kind := channelKind(m["type"], gid)
-				if kind == "" && m["recipients"] != "" {
-					kind = "unknown-dm"
-					if strings.Contains(m["recipients"], "\n") {
-						kind = "group"
-					}
-				}
 				if kind == "" {
 					kind = "unknown"
 				}
-				observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Recipients: m["recipients"], Rank: 3}
+				observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Recipients: m["recipients"], Rank: sourcePriority(3, slot)}
 				if kind == "group" {
-					observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: 3}
+					observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: sourcePriority(3, slot)}
 				}
 				metadata = append(metadata, observation)
 			case 3:
@@ -384,6 +437,15 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					return e
 				}
 				facts := activityRecord(m, activityOrigin)
+				facts.Channel.Rank = sourcePriority(facts.Channel.Rank, slot)
+				facts.Channel.GuildRank = sourcePriority(facts.Channel.GuildRank, slot)
+				facts.Channel.ServerRank = sourcePriority(facts.Channel.ServerRank, slot)
+				facts.Channel.KindRank = sourcePriority(facts.Channel.KindRank, slot)
+				facts.Server.Rank = sourcePriority(facts.Server.Rank, slot)
+				facts.Sent.KindRank = sourcePriority(facts.Sent.KindRank, slot)
+				if e := collectServer(facts.Server); e != nil {
+					return e
+				}
 				if observation := facts.Channel; observation.ID != "" {
 					if !observations[observation] {
 						if len(observations) >= 16384 {
@@ -410,16 +472,39 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 						return flushSentMessages()
 					}
 				}
+			case 5:
+				switch path.Base(strings.ToLower(f.name)) {
+				case "guild.json":
+					id := cmp.Or(m["id"], f.guild)
+					if m["id"] != "" && m["id"] != f.guild {
+						return fmt.Errorf("server metadata ID does not match its directory")
+					}
+					if digits(id) && m["name"] != "" {
+						if e := collectServer(store.ServerObservation{ID: id, Name: m["name"], Rank: sourcePriority(4, slot)}); e != nil {
+							return e
+						}
+					}
+				case "channels.json":
+					id := m["id"]
+					kind := channelKind(m["type"], f.guild)
+					if digits(id) && m["name"] != "" && kind == "guild" {
+						priority := sourcePriority(4, slot)
+						metadata = append(metadata, store.ChannelObservation{ID: id, Name: m["name"], Guild: f.guild, Kind: kind, Rank: priority, KindRank: priority})
+					}
+				}
 			}
 			return nil
 		}
 		field := func(k, v string) error {
 			if f.category == 1 && digits(k) {
-				name, guild, kind := label(v)
-				metadata = append(metadata, store.ChannelObservation{ID: k, Name: name, Server: guild, Kind: kind, Rank: 1})
+				name, guild, kind := store.ClassifyChannelLabel(v)
+				metadata = append(metadata, store.ChannelObservation{ID: k, Name: name, Server: guild, Kind: kind, Rank: sourcePriority(1, slot)})
 				if len(metadata) >= 512 {
 					return flushMetadata()
 				}
+			}
+			if f.category == 5 && path.Base(strings.ToLower(f.name)) == "index.json" && digits(k) && v != "" {
+				return collectServer(store.ServerObservation{ID: k, Name: v, Rank: sourcePriority(3, slot)})
 			}
 			return nil
 		}
@@ -427,11 +512,15 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			e = readCSV(g, record)
 		} else if f.category == 3 {
 			e = readMessages(g, record)
-		} else if f.category == 0 || f.category == 2 {
+		} else if f.category == 0 || f.category == 2 || f.category == 5 && path.Base(strings.ToLower(f.name)) == "guild.json" {
 			d := json.NewDecoder(g)
 			d.UseNumber()
 			var root map[string]string
-			root, e = walk(d, 0, collectName, nil)
+			object := collectName
+			if f.category == 5 {
+				object = nil
+			}
+			root, e = walk(d, 0, object, nil)
 			if e == nil {
 				e = record(root)
 			}
@@ -469,7 +558,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		if e == nil && f.category == 4 && len(names) > 0 {
 			e = s.Names(ctx, slot, names)
 		}
-		e = errors.Join(e, flushMessages(), flushMetadata(), flushEvents(), flushSentMessages(), r.Close())
+		e = errors.Join(e, flushMessages(), flushMetadata(), flushEvents(), flushSentMessages(), flushServerNames(), r.Close())
 		if delta := g.bytes - reported; delta > 0 {
 			processed.Add(delta)
 		}
@@ -481,7 +570,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 	}
 	runStage := func(category int) (int, error) {
 		started := time.Now()
-		phase := []string{"account", "index", "channels", "messages", "activity"}[category]
+		phase := []string{"account", "index", "channels", "messages", "activity", "servers"}[category]
 		publish(phase, true)
 		results := parallelFiles(ctx, limiter, stages[category], func(f file) error { return processFile(f, phase) })
 		if e := ctx.Err(); e != nil {
@@ -516,7 +605,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		snapshot.Complete = true
 		publish("messages", true)
 	}
-	for _, category := range []int{1, 2} {
+	for _, category := range []int{1, 2, 5} {
 		if _, e := runStage(category); e != nil {
 			return e
 		}
@@ -602,31 +691,33 @@ func readMessages(r io.Reader, fn func(map[string]string) error) error {
 	}
 	return e
 }
-func label(v string) (string, string, string) {
-	v = strings.TrimSpace(v)
-	lower := strings.ToLower(v)
-	const directPrefix = "direct message with "
-	if strings.HasPrefix(lower, directPrefix) {
-		participant := strings.TrimSpace(v[len(directPrefix):])
-		if participant == "" || strings.Contains(strings.ToLower(participant), "unknown participant") {
-			return v, "", "unknown-dm"
+
+func addIdentityAlias(aliases, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return aliases
+	}
+	for alias := range strings.SplitSeq(aliases, "\n") {
+		if strings.EqualFold(alias, value) {
+			return aliases
 		}
-		return v, "", "dm"
 	}
-	if name, ok := strings.CutPrefix(v, "@"); ok && strings.TrimSpace(name) != "" {
-		return v, "", "dm"
+	if aliases == "" {
+		return value
 	}
-	if i := strings.LastIndex(lower, " in "); i >= 0 {
-		return v[:i], v[i+4:], "guild"
+	if len(aliases)+1+len(value) > 4096 {
+		return aliases
 	}
-	if strings.HasPrefix(lower, "unknown channel, ") {
-		return "Unknown channel", v[len("Unknown channel, "):], "guild"
-	}
-	if strings.EqualFold(v, "None") || v == "" {
-		return "", "", "unknown"
-	}
-	return v, "", "unknown"
+	return aliases + "\n" + value
 }
+
+func sourcePriority(level, slot int) int {
+	if level <= 0 {
+		return 0
+	}
+	return level*2 + slot
+}
+
 func readCSV(r io.Reader, fn func(map[string]string) error) error {
 	c := csv.NewReader(r)
 	h, e := c.Read()

@@ -11,6 +11,9 @@ import (
 type Suggestion struct {
 	Value, Label, Detail string
 	Cursor               int
+	Fallback             bool
+	ServerFallback       bool
+	Kind                 string
 }
 
 var searchGuidance = map[string]string{
@@ -32,7 +35,7 @@ func CompleteSearch(text string, cursor int, catalog store.SearchCatalog) []Sugg
 	key, value, hasKey := strings.Cut(strings.TrimPrefix(partial, "-"), ":")
 	key = strings.ToLower(key)
 	var out []Suggestion
-	add := func(replacement, label, detail string) {
+	add := func(replacement, label, detail string, choices ...store.SearchChoice) {
 		if current.Exclude {
 			replacement = "-" + replacement
 		}
@@ -41,7 +44,13 @@ func CompleteSearch(text string, cursor int, catalog store.SearchCatalog) []Sugg
 		if !strings.HasSuffix(replacement, ":") && (suffix == "" || suffix[0] != ' ') {
 			prefix += " "
 		}
-		out = append(out, Suggestion{Value: prefix + suffix, Label: label, Detail: detail, Cursor: len([]rune(prefix))})
+		suggestion := Suggestion{Value: prefix + suffix, Label: label, Detail: detail, Cursor: len([]rune(prefix))}
+		if len(choices) > 0 {
+			suggestion.Fallback = choices[0].Fallback
+			suggestion.ServerFallback = choices[0].ServerFallback
+			suggestion.Kind = choices[0].Kind
+		}
+		out = append(out, suggestion)
 	}
 	if !hasKey || !slices.Contains(store.SearchKeys, key) {
 		for _, k := range store.SearchKeys {
@@ -119,7 +128,7 @@ func CompleteSearch(text string, cursor int, catalog store.SearchCatalog) []Sugg
 		if choice.Recent != "" {
 			detail += "  " + store.LocalDate(choice.Recent)
 		}
-		add(key+":"+store.QuoteSearch(choice.ID), choice.Name, detail)
+		add(key+":"+store.QuoteSearch(choice.ID), choice.Name, detail, choice)
 	}
 	return out
 }

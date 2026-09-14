@@ -48,7 +48,7 @@ var (
 	entityLabels   = map[store.Entity]string{store.EntityServers: "Servers", store.EntityChannels: "Channels", store.EntityPeople: "Conversations", store.EntityGames: "Games", store.EntityPlatforms: "Platforms", store.EntityEmoji: "Emoji"}
 	weekdays       = []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
 	weekdayNames   = []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
-	topBoards      = []boardSpec{{"", store.EntityServers, store.MetricMessages}, {"", store.EntityServers, store.MetricVoiceTime}, {"", store.EntityServers, store.MetricMissing}, {"", store.EntityChannels, store.MetricMessages}, {"", store.EntityChannels, store.MetricMedia}, {"", store.EntityChannels, store.MetricLinks}, {"", store.EntityPeople, store.MetricMessages}, {"", store.EntityPeople, store.MetricVoiceTime}, {"", store.EntityPeople, store.MetricWords}, {"", store.EntityGames, store.MetricPlayTime}, {"", store.EntityPlatforms, store.MetricSessions}, {"", store.EntityEmoji, store.MetricReactions}}
+	topBoards      = []boardSpec{{"", store.EntityServers, store.MetricMessages}, {"", store.EntityServers, store.MetricVoiceTime}, {"", store.EntityServers, store.MetricMissing}, {"", store.EntityChannels, store.MetricMessages}, {"", store.EntityChannels, store.MetricVoiceTime}, {"", store.EntityChannels, store.MetricMedia}, {"", store.EntityPeople, store.MetricMessages}, {"", store.EntityPeople, store.MetricVoiceTime}, {"", store.EntityPeople, store.MetricWords}, {"", store.EntityGames, store.MetricPlayTime}, {"", store.EntityPlatforms, store.MetricSessions}, {"", store.EntityEmoji, store.MetricReactions}}
 )
 
 const overviewRows = 5
@@ -615,7 +615,7 @@ func (m *Model) card(id, title, body string, width int) string {
 	var titleColor lipgloss.Color
 	if id != "" {
 		m.Actions = append(m.Actions, id)
-		title = "▸ " + title
+		title = "\u25b8\ufe0e " + title
 		border = components.Accent
 		titleColor = components.Accent
 		moreID := "stats-more-" + strings.TrimPrefix(id, "stats-open-")
@@ -669,17 +669,14 @@ func (m *Model) boardCard(spec boardSpec, width int, limit int) string {
 	}
 	for i, l := range leaders {
 		distance := fadeDistance(active, i)
-		nameColor := components.Fade(components.Text, distance)
 		valueColor := components.Fade(components.Muted, distance)
-		nameStyle := lipgloss.NewStyle().Foreground(nameColor)
 		if i == active {
-			nameStyle = nameStyle.Bold(true).Foreground(components.Pink)
 			valueColor = components.Text
 		}
 		amount := fmt.Sprintf("%*s", valueWidth, metricValue(spec.metric, l.Values[spec.metric]))
 		nameWidth := max(4, inner-valueWidth-barWidth-2)
-		name := components.Fit(leaderName(l), nameWidth)
-		line := nameStyle.Render(name) + strings.Repeat(" ", max(1, nameWidth-lipgloss.Width(name)+1))
+		name := styledLeaderName(l, nameWidth, components.Text, distance, i == active)
+		line := name + strings.Repeat(" ", max(1, nameWidth-lipgloss.Width(name)+1))
 		if barWidth > 0 {
 			line += heatRule(m.StatsPalette, float64(l.Values[spec.metric])/float64(peak), barWidth) + " "
 		}
@@ -867,13 +864,44 @@ func entityNoun(entity store.Entity, n int) string {
 }
 
 func leaderName(l store.Leader) string {
+	name := ""
 	switch l.Kind {
 	case "dm", "unknown-dm", "group":
-		return displayChannel(store.Row{Name: l.Name, Kind: l.Kind})
+		name = displayChannel(store.Row{Name: l.Name, Kind: l.Kind})
 	case "emoji":
 		return ":" + session.Safe(l.Name) + ":"
+	default:
+		name = session.Safe(l.Name)
 	}
-	return session.Safe(l.Name)
+	if l.ParentName != "" {
+		return session.Safe(l.ParentName) + " / " + name
+	}
+	return name
+}
+
+func styledLeaderName(l store.Leader, width int, base lipgloss.Color, distance int, active bool) string {
+	name := leaderName(store.Leader{Name: l.Name, Kind: l.Kind})
+	nameColor := components.Fade(base, distance)
+	if l.Fallback {
+		nameColor = components.Fade(components.Muted, distance)
+	} else if l.Kind == "group" {
+		nameColor = components.Fade(components.GroupDM, distance)
+	} else if active {
+		nameColor = components.Pink
+	}
+	nameStyle := lipgloss.NewStyle().Foreground(nameColor).Bold(active)
+	if l.ParentName == "" {
+		return components.FitStyled(nameStyle.Render(name), width)
+	}
+	parentColor := components.Fade(base, distance)
+	if l.ParentFallback {
+		parentColor = components.Fade(components.Muted, distance)
+	} else if active {
+		parentColor = components.Pink
+	}
+	parentStyle := lipgloss.NewStyle().Foreground(parentColor).Bold(active)
+	separator := lipgloss.NewStyle().Foreground(components.Fade(components.Muted, distance)).Render(" / ")
+	return components.FitStyled(parentStyle.Render(session.Safe(l.ParentName))+separator+nameStyle.Render(name), width)
 }
 
 // drillHint says what opening a ranked item will show.
@@ -950,18 +978,16 @@ func (m *Model) entity(w, h int) string {
 			}
 		}
 		valueColor := components.Fade(components.Text, distance)
-		nameStyle := lipgloss.NewStyle().Foreground(components.Fade(components.Text, distance))
 		valueStyle := lipgloss.NewStyle().Foreground(valueColor)
 		if current {
 			valueColor = components.Pink
 			valueStyle = valueStyle.Bold(true).Foreground(components.Pink)
-			nameStyle = nameStyle.Bold(true)
 		}
 		bar := heatRule(m.StatsPalette, float64(l.Values[metric])/float64(max(1, peak)), barWidth)
 		value := m.figure("row/"+string(entity)+"/"+metric.Key()+"/"+l.ID, amount, l.Values[metric], valueStyle, valueColor)
 		right := bar + " " + m.tip(fmt.Sprintf("tip-row-%d", i), tipText, value)
 		nameWidth := max(8, cw-rankWidth-barWidth-valueWidth-3)
-		name := nameStyle.Render(components.Fit(leaderName(l), nameWidth))
+		name := styledLeaderName(l, nameWidth, components.Text, distance, current)
 		line := rank + name + strings.Repeat(" ", max(1, nameWidth-lipgloss.Width(name)+1)) + right
 		rowStyle := lipgloss.NewStyle().Width(cw)
 		if current {
@@ -1026,16 +1052,16 @@ func (m *Model) statsMessages(w, h int) string {
 			metaColor = components.Deleted
 		}
 		contentColor := components.Text
-		if r.SendEvent && !r.MessageRecord {
+		if unavailableStatus(r.Status) {
+			contentColor = components.Deleted
+		} else if r.SendEvent && !r.MessageRecord {
 			contentColor = components.Muted
 		}
-		metaStyle := lipgloss.NewStyle().Foreground(components.Fade(metaColor, distance))
 		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(contentColor, distance))
 		mutedColor := components.Fade(components.Muted, distance)
 		rowStyle := lipgloss.NewStyle().Padding(0, 1).Width(cw - 2)
 		if hover {
 			rowStyle = rowStyle.Background(components.Surface)
-			metaStyle = metaStyle.Bold(true).Foreground(components.Pink)
 		}
 		media := ""
 		if r.HasMedia {
@@ -1046,7 +1072,7 @@ func (m *Model) statsMessages(w, h int) string {
 		date := m.messageDate(fmt.Sprintf("sdate-%d", i), r.Date, mutedColor) + lipgloss.NewStyle().Foreground(mutedColor).Render(media)
 		metaWidth := cw - 4
 		nameWidth := max(8, metaWidth-lipgloss.Width(date)-2)
-		name := metaStyle.Render(components.Fit(r.Server+" / "+displayChannel(r), nameWidth))
+		name := styledMessageLocation(r, nameWidth, metaColor, distance, hover, false)
 		meta := name + strings.Repeat(" ", max(1, metaWidth-lipgloss.Width(name)-lipgloss.Width(date))) + date
 		preview := messagePreview(r)
 		content := contentStyle.Render(components.Fit(preview, cw-4))

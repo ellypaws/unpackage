@@ -302,17 +302,21 @@ func (m *Model) View() string {
 		r := m.Detail
 		m.Viewport.Width = w - 4
 		m.Viewport.Height = h - 3
-		titleStyle := components.Title
+		messageColor := components.Text
 		if unavailableStatus(r.Status) {
-			titleStyle = titleStyle.Foreground(components.Deleted)
+			messageColor = components.Deleted
 		}
-		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(components.Text))
+		messageContent := components.Highlight(r.Content, m.Session.Filter.Search, lipgloss.NewStyle().Foreground(messageColor))
 		if strings.TrimSpace(r.Content) == "" {
 			unavailable := "No text content"
 			if r.SendEvent && !r.MessageRecord {
 				unavailable = "Content is not included in the send_message analytics event."
 			}
-			messageContent = lipgloss.NewStyle().Foreground(components.Muted).Render(unavailable)
+			emptyColor := components.Muted
+			if unavailableStatus(r.Status) {
+				emptyColor = components.Deleted
+			}
+			messageContent = lipgloss.NewStyle().Foreground(emptyColor).Render(unavailable)
 		}
 		attachments := lipgloss.NewStyle().Foreground(components.Muted).Render("None")
 		if len(r.AttachmentURLs) > 0 {
@@ -346,7 +350,7 @@ func (m *Model) View() string {
 		}
 		metadata := lipgloss.NewStyle().Foreground(components.Muted).Render(strings.Join(metadataLines, "\n"))
 		contentWidth := max(1, w-4)
-		content := titleStyle.Render(session.Safe(r.Server)+" / "+displayChannel(*r)) + "\n\n" + dateDetails + "\n\n" + components.TitleRule("Message content", contentWidth, m.Frame, false) + "\n" + messageContent + "\n\n" + components.TitleRule("Attachments", contentWidth, m.Frame, false) + "\n" + attachments + "\n\n" + metadata
+		content := styledMessageLocation(*r, contentWidth, components.Accent, -1, false, true) + "\n\n" + dateDetails + "\n\n" + components.TitleRule("Message content", contentWidth, m.Frame, false) + "\n" + messageContent + "\n\n" + components.TitleRule("Attachments", contentWidth, m.Frame, false) + "\n" + attachments + "\n\n" + metadata
 		m.Viewport.SetContent(lipgloss.NewStyle().Width(w - 4).Render(content))
 		body = m.button("detail-close", "Back to results", false) + "\n\n" + m.Viewport.View()
 	} else {
@@ -577,9 +581,8 @@ func displayChannel(r store.Row) string {
 		}
 	}
 	if r.Kind == "dm" || r.Kind == "unknown-dm" {
-		const prefix = "direct message with "
-		if strings.HasPrefix(strings.ToLower(name), prefix) {
-			name = strings.TrimSpace(name[len(prefix):])
+		if participant, ok := store.ConversationParticipant(name); ok {
+			name = participant
 		}
 		if head, tail, ok := strings.Cut(name, "#"); ok && tail != "" && strings.Trim(tail, "0123456789") == "" {
 			name = head
@@ -587,6 +590,37 @@ func displayChannel(r store.Row) string {
 		return "@" + strings.TrimPrefix(name, "@")
 	}
 	return name
+}
+
+func styledMessageLocation(r store.Row, width int, base lipgloss.Color, distance int, active, bold bool) string {
+	missing := unavailableStatus(r.Status)
+	serverColor := components.Fade(base, distance)
+	channelColor := components.Fade(base, distance)
+	separatorColor := components.Fade(components.Muted, distance)
+	if missing {
+		serverColor = components.Fade(components.Deleted, distance)
+		channelColor = serverColor
+		separatorColor = serverColor
+	} else {
+		if r.ServerFallback {
+			serverColor = components.Fade(components.Muted, distance)
+		}
+		if r.NameFallback {
+			channelColor = components.Fade(components.Muted, distance)
+		} else if r.Kind == "group" {
+			channelColor = components.Fade(components.GroupDM, distance)
+		} else if active {
+			channelColor = components.Pink
+		}
+		if active && !r.ServerFallback {
+			serverColor = components.Pink
+		}
+	}
+	serverStyle := lipgloss.NewStyle().Foreground(serverColor).Bold(bold || active)
+	channelStyle := lipgloss.NewStyle().Foreground(channelColor).Bold(bold || active)
+	separatorStyle := lipgloss.NewStyle().Foreground(separatorColor).Bold(bold)
+	location := serverStyle.Render(session.Safe(r.Server)) + separatorStyle.Render(" / ") + channelStyle.Render(displayChannel(r))
+	return components.FitStyled(location, width)
 }
 func (m *Model) wide() bool { return m.Width >= 110 }
 func (m *Model) investigate(w, h int) string {
@@ -807,16 +841,16 @@ func (m *Model) messages(w, h int) string {
 			metaColor = components.Deleted
 		}
 		contentColor := components.Text
-		if r.SendEvent && !r.MessageRecord {
+		if unavailableStatus(r.Status) {
+			contentColor = components.Deleted
+		} else if r.SendEvent && !r.MessageRecord {
 			contentColor = components.Muted
 		}
-		metaStyle := lipgloss.NewStyle().Foreground(components.Fade(metaColor, distance))
 		contentStyle := lipgloss.NewStyle().Foreground(components.Fade(contentColor, distance))
 		mutedColor := components.Fade(components.Muted, distance)
 		rowStyle := lipgloss.NewStyle().Padding(0, 1).Width(listWidth - 2)
 		if hover {
 			rowStyle = rowStyle.Background(components.Surface)
-			metaStyle = metaStyle.Bold(true).Foreground(components.Pink)
 		}
 		action := ""
 		if eligible {
@@ -838,7 +872,7 @@ func (m *Model) messages(w, h int) string {
 			metaWidth -= lipgloss.Width(action) + 1
 		}
 		nameWidth := max(8, metaWidth-lipgloss.Width(date)-2)
-		name := metaStyle.Render(components.Fit(r.Server+" / "+displayChannel(r), nameWidth))
+		name := styledMessageLocation(r, nameWidth, metaColor, distance, hover, false)
 		meta := name + strings.Repeat(" ", max(1, metaWidth-lipgloss.Width(name)-lipgloss.Width(date))) + date
 		if action != "" {
 			meta += " " + action
@@ -980,20 +1014,30 @@ func (m *Model) servers() string {
 		} else if exclude {
 			mark = "[-] "
 		}
-		style := lipgloss.NewStyle().Foreground(components.Text)
+		markStyle := lipgloss.NewStyle().Foreground(components.Text)
+		nameStyle := lipgloss.NewStyle().Foreground(components.Text)
+		if g.Fallback {
+			nameStyle = nameStyle.Foreground(components.Muted)
+		}
 		boxStyle := lipgloss.NewStyle().Width(cellWidth-2).Padding(0, 1)
 		if include {
 			boxStyle = boxStyle.Background(components.Surface)
-			style = style.Foreground(components.Accent).Bold(true)
+			markStyle = markStyle.Foreground(components.Accent).Bold(true)
+			nameStyle = nameStyle.Bold(true)
 		} else if exclude {
 			boxStyle = boxStyle.Background(components.Surface)
-			style = style.Foreground(components.Deleted).Bold(true)
+			markStyle = markStyle.Foreground(components.Deleted).Bold(true)
+			nameStyle = nameStyle.Bold(true)
 		}
 		if m.Hover == id || m.Focus == id {
 			boxStyle = boxStyle.Background(components.SurfaceHover)
-			style = style.Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+			markStyle = markStyle.Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+			nameStyle = nameStyle.Bold(true)
+			if !g.Fallback {
+				nameStyle = nameStyle.Foreground(lipgloss.Color("#FFFFFF"))
+			}
 		}
-		name := components.Highlight(components.Fit(g.Name, cellWidth-6), m.ServerSearch, style)
+		name := components.Highlight(components.Fit(g.Name, cellWidth-6), m.ServerSearch, nameStyle)
 		label := "messages"
 		if g.Count == 1 {
 			label = "message"
@@ -1002,7 +1046,7 @@ func (m *Model) servers() string {
 		if g.Missing > 0 {
 			summary += ", " + number(g.Missing) + " missing"
 		}
-		content := style.Render(mark) + name + "\n    " + components.Rule(float64(g.Count)/float64(peak), 7) + " " + lipgloss.NewStyle().Foreground(components.Muted).Render(components.Fit(summary, cellWidth-14))
+		content := markStyle.Render(mark) + name + "\n    " + components.Rule(float64(g.Count)/float64(peak), 7) + " " + lipgloss.NewStyle().Foreground(components.Muted).Render(components.Fit(summary, cellWidth-14))
 		col := (i - m.ServerOffset) % columns
 		lines[col] = append(lines[col], m.Zones.Mark(id, boxStyle.Render(content)))
 	}

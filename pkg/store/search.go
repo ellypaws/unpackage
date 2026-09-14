@@ -127,12 +127,22 @@ func searchEqual(value string, candidates ...string) bool {
 }
 
 func directParticipant(name string) string {
-	name = strings.TrimSpace(name)
-	const prefix = "direct message with "
-	if strings.HasPrefix(strings.ToLower(name), prefix) {
-		return strings.TrimSpace(name[len(prefix):])
+	if participant, ok := ConversationParticipant(name); ok {
+		return participant
 	}
-	return name
+	return strings.TrimSpace(name)
+}
+
+func identitySearchEqual(value string, person identity) bool {
+	if searchEqual(value, person.username, person.globalName, identityDisplay(person)) {
+		return true
+	}
+	for alias := range strings.SplitSeq(person.aliases, "\n") {
+		if searchEqual(value, alias) {
+			return true
+		}
+	}
+	return false
 }
 
 // Repeated values form a set; distinct filters intersect. Exclusions always subtract.
@@ -195,6 +205,9 @@ func (q SearchQuery) channelMatches(c channel, id, label, owner string, lookup f
 				if recipient != "" && searchEqual(t.Value, recipient, lookup(recipient)) {
 					return true
 				}
+			}
+			if c.kind != "group" && c.recipients == "" && searchEqual(t.Value, id) {
+				return true
 			}
 			return searchEqual(t.Value, c.name, label)
 		}
@@ -266,7 +279,10 @@ func messageHas(m Message, kind string) bool {
 	return false
 }
 
-type SearchChoice struct{ ID, Name, Guild, Server, Kind, Recent string }
+type SearchChoice struct {
+	ID, Name, Guild, Server, Kind, Recent string
+	Fallback, ServerFallback              bool
+}
 type SearchCatalog struct {
 	Channels, Users, Servers []SearchChoice
 	Loading                  bool
@@ -278,22 +294,31 @@ func (s *Store) SearchCatalog(ctx context.Context) SearchCatalog {
 	users, servers := map[string]SearchChoice{}, map[string]SearchChoice{}
 	lookup := s.nameLookupLocked()
 	same := sameOwner(s.snapshots[0], s.snapshots[1])
-	labels := serverLabels(s.effectiveChannelsLocked(same))
+	serverIndex := s.serverNameIndexLocked(same)
+	labels := s.serverLabelsLocked(s.effectiveChannelsLocked(same), same)
 	channels := map[string]channel{}
+	owner := ""
+	if s.snapshots[0] != nil {
+		owner = s.snapshots[0].Owner
+	} else if s.snapshots[1] != nil {
+		owner = s.snapshots[1].Owner
+	}
 	for slot, cs := range s.channels {
 		if !same && (s.snapshots[0] != nil && slot != 0 || s.snapshots[0] == nil && slot != 1) {
 			continue
 		}
 		for id, c := range cs {
-			channels[id] = merge(channels[id], c)
+			channels[id] = merge(channels[id], resolveChannelServer(c, serverIndex))
 		}
-		for id, name := range s.names[slot] {
-			users[id] = SearchChoice{ID: id, Name: name, Kind: "Known user"}
+		for id := range s.names[slot] {
+			name := lookup(id)
+			users[id] = SearchChoice{ID: id, Name: cmp.Or(name, id), Kind: "Known user", Fallback: name == ""}
 		}
 		if snapshot := s.snapshots[slot]; snapshot != nil {
 			out.Loading = out.Loading || snapshot.State == "loading"
 			if snapshot.Owner != "" {
-				users[snapshot.Owner] = SearchChoice{ID: snapshot.Owner, Name: cmp.Or(lookup(snapshot.Owner), "me"), Kind: "Your messages"}
+				name := lookup(snapshot.Owner)
+				users[snapshot.Owner] = SearchChoice{ID: snapshot.Owner, Name: cmp.Or(name, "me"), Kind: "Your messages", Fallback: name == ""}
 			}
 		}
 	}
@@ -304,27 +329,36 @@ func (s *Store) SearchCatalog(ctx context.Context) SearchCatalog {
 		}
 		c = applyServerLabel(c, labels)
 		recent := max(s.recent[0][id], s.recent[1][id])
+		if recent == "" {
+			continue
+		}
+		name := channelDisplay(c, id, owner, lookup)
+		server := serverDisplay(c)
 		guild := c.guild
 		if c.conflict {
 			guild = ""
+			c.kind = "conflict"
 		}
-		out.Channels = append(out.Channels, SearchChoice{ID: id, Name: channelLabel(c, id, lookup), Guild: guild, Server: c.server, Kind: c.kind, Recent: recent})
+		out.Channels = append(out.Channels, SearchChoice{ID: id, Name: name.text, Guild: guild, Server: server.text, Kind: c.kind, Recent: recent, Fallback: name.fallback, ServerFallback: server.fallback})
 		if guild != "" {
-			servers[guild] = SearchChoice{ID: guild, Name: c.server, Recent: max(recent, servers[guild].Recent)}
+			servers[guild] = SearchChoice{ID: guild, Name: server.text, Recent: max(recent, servers[guild].Recent), Fallback: server.fallback}
 		}
 		if c.kind == "dm" || c.kind == "group" || c.kind == "unknown-dm" {
 			for person := range strings.SplitSeq(c.recipients, "\n") {
 				if person != "" {
 					u := users[person]
 					u.ID = person
-					u.Name = cmp.Or(lookup(person), person)
+					name := lookup(person)
+					u.Name = cmp.Or(name, person)
+					u.Fallback = name == ""
 					u.Kind = "Conversation participant"
 					u.Recent = max(u.Recent, recent)
 					users[person] = u
 				}
 			}
-			if c.kind != "group" && c.name != "" {
-				users[c.name] = SearchChoice{ID: c.name, Name: directParticipant(c.name), Kind: "Conversation participant", Recent: recent}
+			if c.kind != "group" && c.name != "" && c.recipients == "" {
+				participant := directParticipant(c.name)
+				users[id] = SearchChoice{ID: id, Name: directLabel(participant), Kind: "Conversation participant", Recent: recent, Fallback: unresolvedParticipant(participant)}
 			}
 		}
 	}
