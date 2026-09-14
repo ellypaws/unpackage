@@ -118,12 +118,21 @@ func QuoteSearch(value string) string {
 }
 
 func searchEqual(value string, candidates ...string) bool {
-	value = strings.TrimPrefix(value, "Direct Message with ")
+	value = directParticipant(value)
 	value = strings.TrimPrefix(strings.TrimPrefix(value, "@"), "#")
 	return slices.ContainsFunc(candidates, func(candidate string) bool {
-		candidate = strings.TrimPrefix(candidate, "Direct Message with ")
+		candidate = directParticipant(candidate)
 		return strings.EqualFold(value, strings.TrimPrefix(strings.TrimPrefix(candidate, "@"), "#"))
 	})
+}
+
+func directParticipant(name string) string {
+	name = strings.TrimSpace(name)
+	const prefix = "direct message with "
+	if strings.HasPrefix(strings.ToLower(name), prefix) {
+		return strings.TrimSpace(name[len(prefix):])
+	}
+	return name
 }
 
 // Repeated values form a set; distinct filters intersect. Exclusions always subtract.
@@ -315,7 +324,7 @@ func (s *Store) SearchCatalog(ctx context.Context) SearchCatalog {
 				}
 			}
 			if c.kind != "group" && c.name != "" {
-				users[c.name] = SearchChoice{ID: c.name, Name: strings.TrimPrefix(c.name, "Direct Message with "), Kind: "Conversation participant", Recent: recent}
+				users[c.name] = SearchChoice{ID: c.name, Name: directParticipant(c.name), Kind: "Conversation participant", Recent: recent}
 			}
 		}
 	}

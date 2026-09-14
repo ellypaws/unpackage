@@ -2,7 +2,6 @@ package importer
 
 import (
 	"archive/zip"
-	"cmp"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -209,6 +208,8 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 		var metadata []store.ChannelObservation
 		var events []store.Event
 		var sentMessages []store.SentMessage
+		var names map[string]string
+		var lastNameID, lastName string
 		observations := map[store.ChannelObservation]bool{}
 		activityOrigin := store.ActivityOther
 		if f.category == 4 {
@@ -257,6 +258,34 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			}
 			return e
 		}
+		collectName := func(m map[string]string) error {
+			id := m["id"]
+			if id == "" {
+				return nil
+			}
+			name := m["global_name"]
+			global := name != ""
+			if name == "" {
+				name = m["username"]
+			}
+			if name == "" || (id == lastNameID && name == lastName) {
+				return nil
+			}
+			current := names[id]
+			if (!global && current != "") || current == name {
+				lastNameID, lastName = id, name
+				return nil
+			}
+			if !digits(id) || (current == "" && len(names) >= 1<<16) {
+				return nil
+			}
+			if names == nil {
+				names = make(map[string]string)
+			}
+			names[id] = name
+			lastNameID, lastName = id, name
+			return nil
+		}
 		progress := func() error {
 			if time.Since(lastProgress) < 150*time.Millisecond {
 				return ctx.Err()
@@ -299,27 +328,28 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					return nil
 				}
 			case 2:
-				if m["id"] == f.channel {
-					gid := m["guild_id"]
-					if gid == "" && digits(m["guild"]) {
-						gid = m["guild"]
-					}
-					kind := channelKind(m["type"], gid)
-					if kind == "" && m["recipients"] != "" {
-						kind = "dm"
-						if strings.Contains(m["recipients"], "\n") {
-							kind = "group"
-						}
-					}
-					if kind == "" {
-						kind = "unknown"
-					}
-					observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Recipients: m["recipients"], Rank: 3}
-					if kind == "group" {
-						observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: 3}
-					}
-					metadata = append(metadata, observation)
+				if m["id"] != "" && m["id"] != f.channel {
+					return fmt.Errorf("channel metadata ID does not match its directory")
 				}
+				gid := m["guild_id"]
+				if gid == "" && digits(m["guild"]) {
+					gid = m["guild"]
+				}
+				kind := channelKind(m["type"], gid)
+				if kind == "" && m["recipients"] != "" {
+					kind = "unknown-dm"
+					if strings.Contains(m["recipients"], "\n") {
+						kind = "group"
+					}
+				}
+				if kind == "" {
+					kind = "unknown"
+				}
+				observation := store.ChannelObservation{ID: f.channel, Name: m["name"], Guild: gid, Server: m["guild_name"], Kind: kind, Recipients: m["recipients"], Rank: 3}
+				if kind == "group" {
+					observation = store.ChannelObservation{ID: f.channel, Kind: "group", Title: m["name"], Recipients: m["recipients"], Rank: 3}
+				}
+				metadata = append(metadata, observation)
 			case 3:
 				id := m["id"]
 				if id == "" {
@@ -350,6 +380,9 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 					return flushMessages()
 				}
 			case 4:
+				if e := collectName(m); e != nil {
+					return e
+				}
 				facts := activityRecord(m, activityOrigin)
 				if observation := facts.Channel; observation.ID != "" {
 					if !observations[observation] {
@@ -398,17 +431,7 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			d := json.NewDecoder(g)
 			d.UseNumber()
 			var root map[string]string
-			names := map[string]string{}
-			var people func(map[string]string) error
-			if f.category == 0 || f.category == 2 {
-				people = func(m map[string]string) error {
-					if name := cmp.Or(m["global_name"], m["username"]); name != "" && digits(m["id"]) && len(names) < 1<<16 {
-						names[m["id"]] = name
-					}
-					return nil
-				}
-			}
-			root, e = walk(d, 0, people, nil)
+			root, e = walk(d, 0, collectName, nil)
 			if e == nil {
 				e = record(root)
 			}
@@ -442,6 +465,9 @@ func Load(ctx context.Context, s *store.Store, slot int, p string, limiter chan 
 			}
 		} else {
 			e = stream(g, record, field)
+		}
+		if e == nil && f.category == 4 && len(names) > 0 {
+			e = s.Names(ctx, slot, names)
 		}
 		e = errors.Join(e, flushMessages(), flushMetadata(), flushEvents(), flushSentMessages(), r.Close())
 		if delta := g.bytes - reported; delta > 0 {
@@ -577,8 +603,12 @@ func readMessages(r io.Reader, fn func(map[string]string) error) error {
 	return e
 }
 func label(v string) (string, string, string) {
-	if strings.HasPrefix(v, "Direct Message with ") {
-		if strings.Contains(v, "Unknown Participant") {
+	v = strings.TrimSpace(v)
+	lower := strings.ToLower(v)
+	const directPrefix = "direct message with "
+	if strings.HasPrefix(lower, directPrefix) {
+		participant := strings.TrimSpace(v[len(directPrefix):])
+		if participant == "" || strings.Contains(strings.ToLower(participant), "unknown participant") {
 			return v, "", "unknown-dm"
 		}
 		return v, "", "dm"
@@ -586,13 +616,13 @@ func label(v string) (string, string, string) {
 	if name, ok := strings.CutPrefix(v, "@"); ok && strings.TrimSpace(name) != "" {
 		return v, "", "dm"
 	}
-	if i := strings.LastIndex(v, " in "); i >= 0 {
+	if i := strings.LastIndex(lower, " in "); i >= 0 {
 		return v[:i], v[i+4:], "guild"
 	}
-	if strings.HasPrefix(strings.ToLower(v), "unknown channel, ") {
+	if strings.HasPrefix(lower, "unknown channel, ") {
 		return "Unknown channel", v[len("Unknown channel, "):], "guild"
 	}
-	if v == "None" || v == "" {
+	if strings.EqualFold(v, "None") || v == "" {
 		return "", "", "unknown"
 	}
 	return v, "", "unknown"

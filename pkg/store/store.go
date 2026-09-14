@@ -82,6 +82,7 @@ type SentMessage struct {
 	ID, EventID, Channel, Guild string
 	Date                        string
 	Kind                        string
+	KindRank                    int
 	Time                        time.Time
 	Platform                    string
 	Length, Words               int
@@ -99,7 +100,7 @@ type Message struct {
 type ChannelObservation struct {
 	ID, Name, Guild, Server, Kind string
 	Title, Recipients             string
-	Rank                          int
+	Rank, ServerRank, KindRank    int
 }
 type Row struct {
 	ID             string   `json:"message_id"`
@@ -243,6 +244,21 @@ func (s *Store) nameLookupLocked() func(string) string {
 
 // channelLabel names a channel for display; group conversations list their participants by global name.
 func channelLabel(c channel, id string, lookup func(string) string) string {
+	if c.kind == "dm" || c.kind == "unknown-dm" {
+		if !unresolvedParticipant(c.name) {
+			return c.name
+		}
+		for recipient := range strings.SplitSeq(c.recipients, "\n") {
+			name := lookup(recipient)
+			if name == "" && !digits(recipient) {
+				name = recipient
+			}
+			if !unresolvedParticipant(name) {
+				return "Direct Message with " + name
+			}
+		}
+		return cmp.Or(c.name, id)
+	}
 	if c.kind != "group" {
 		return cmp.Or(c.name, id)
 	}
@@ -270,6 +286,11 @@ func channelLabel(c channel, id string, lookup func(string) string) string {
 		return fmt.Sprintf("Group of %d", n)
 	}
 	return id
+}
+
+func unresolvedParticipant(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name == "" || strings.Contains(name, "unknown participant") || name == "deleted user" || strings.HasSuffix(name, "with deleted user")
 }
 
 func digits(v string) bool {
@@ -354,7 +375,13 @@ func mergeSentMessage(a, b SentMessage) SentMessage {
 	a.EventID = mergeText(a.EventID, b.EventID)
 	a.Channel = mergeText(a.Channel, b.Channel)
 	a.Guild = mergeText(a.Guild, b.Guild)
-	a.Kind = mergeText(a.Kind, b.Kind)
+	if a.Kind == "dm" && b.Kind == "unknown-dm" || a.Kind == "unknown-dm" && b.Kind == "dm" {
+		a.Kind = "dm"
+		a.KindRank = max(a.KindRank, b.KindRank)
+	} else if preferField(a.Kind, a.KindRank, b.Kind, b.KindRank) {
+		a.Kind = b.Kind
+		a.KindRank = b.KindRank
+	}
 	a.Platform = mergeDescription(a.Platform, b.Platform)
 	if a.Time.IsZero() || !b.Time.IsZero() && b.Time.Before(a.Time) {
 		a.Time = b.Time
@@ -370,10 +397,12 @@ func mergeSentMessage(a, b SentMessage) SentMessage {
 
 func sentChannel(sent SentMessage) channel {
 	kind := sent.Kind
+	rank := sent.KindRank
 	if kind == "" && sent.Guild != "" {
 		kind = "guild"
+		rank = 2
 	}
-	return channelObservation("", sent.Guild, "", kind, "", "", 2)
+	return channelObservation("", sent.Guild, "", kind, "", "", rank)
 }
 
 // SentMessages merges repeated send_message records from Activity files by message ID.
@@ -512,7 +541,7 @@ func (s *Store) WaitMessages(ctx context.Context) error {
 }
 func merge(a, b channel) channel {
 	a.conflict = a.conflict || b.conflict || (a.guild != "" && b.guild != "" && a.guild != b.guild)
-	if preferField(a.name, a.nameRank, b.name, b.nameRank) {
+	if preferChannelName(a.name, a.nameRank, b.name, b.nameRank) {
 		a.name = b.name
 		a.nameRank = b.nameRank
 	}
@@ -529,13 +558,22 @@ func merge(a, b channel) channel {
 		a.recipients = b.recipients
 	}
 	if a.kind == "dm" && b.kind == "unknown-dm" || a.kind == "unknown-dm" && b.kind == "dm" {
-		a.kind = "unknown-dm"
+		a.kind = "dm"
 		a.kindRank = max(a.kindRank, b.kindRank)
 	} else if b.kind != "unknown" && preferField(a.kind, a.kindRank, b.kind, b.kindRank) {
 		a.kind = b.kind
 		a.kindRank = b.kindRank
 	}
 	return a
+}
+
+func preferChannelName(current string, currentRank int, candidate string, candidateRank int) bool {
+	currentUnknown := unresolvedParticipant(current)
+	candidateUnknown := unresolvedParticipant(candidate)
+	if current != "" && candidate != "" && currentUnknown != candidateUnknown {
+		return currentUnknown
+	}
+	return preferField(current, currentRank, candidate, candidateRank)
 }
 
 func preferField(current string, currentRank int, candidate string, candidateRank int) bool {
@@ -632,7 +670,14 @@ func (s *Store) Channels(ctx context.Context, slot int, observations []ChannelOb
 		if observation.ID == "" {
 			continue
 		}
-		s.channels[slot][observation.ID] = merge(s.channels[slot][observation.ID], channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank))
+		candidate := channelObservation(observation.Name, observation.Guild, observation.Server, observation.Kind, observation.Title, observation.Recipients, observation.Rank)
+		if observation.Server != "" && observation.ServerRank > 0 {
+			candidate.serverRank = observation.ServerRank
+		}
+		if observation.Kind != "" && observation.KindRank > 0 {
+			candidate.kindRank = observation.KindRank
+		}
+		s.channels[slot][observation.ID] = merge(s.channels[slot][observation.ID], candidate)
 	}
 	s.invalidateRows()
 	return nil
@@ -1119,10 +1164,8 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		server := c.server
 		if server == "" {
 			switch c.kind {
-			case "dm":
+			case "dm", "unknown-dm":
 				server = "Direct messages"
-			case "unknown-dm":
-				server = "Unknown participants"
 			case "group":
 				server = "Group messages"
 			default:

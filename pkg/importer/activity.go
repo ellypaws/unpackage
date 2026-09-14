@@ -81,13 +81,32 @@ func activityCount(v string) int {
 func activityRecord(m map[string]string, source store.ActivitySource) activityFacts {
 	channel, guild := activityChannel(m)
 	kind := channelKind(m["channel_type"], guild)
+	structuredKind := kind != ""
+	kindRank := 2
 	name := m["channel_name"]
+	server := m["guild_name"]
+	serverRank := 2
 	title := ""
 	recipients := cmp.Or(m["recipient_ids"], m["recipients"])
-	if kind == "" && strings.EqualFold(m["private"], "true") {
-		kind = "unknown-dm"
-		if strings.Contains(recipients, "\n") {
+	if kind == "" && name != "" {
+		_, inferredServer, inferredKind := label(name)
+		if inferredKind != "unknown" {
+			kind = inferredKind
+			kindRank = 1
+			if server == "" && inferredServer != "" {
+				server = inferredServer
+				serverRank = 1
+			}
+		}
+	}
+	if !structuredKind && strings.EqualFold(m["private"], "true") {
+		switch {
+		case strings.Contains(recipients, "\n"):
 			kind = "group"
+			kindRank = 2
+		case kind == "" || kind == "unknown-dm":
+			kind = "unknown-dm"
+			kindRank = 2
 		}
 	}
 	if kind == "group" {
@@ -95,8 +114,8 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 		name = ""
 	}
 	facts := activityFacts{}
-	if channel != "" && (name != "" || guild != "" || m["guild_name"] != "" || kind != "" || title != "" || recipients != "") {
-		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: guild, Server: m["guild_name"], Kind: kind, Title: title, Recipients: recipients, Rank: 2}
+	if channel != "" && (name != "" || guild != "" || server != "" || kind != "" || title != "" || recipients != "") {
+		facts.Channel = store.ChannelObservation{ID: channel, Name: name, Guild: guild, Server: server, Kind: kind, Title: title, Recipients: recipients, Rank: 2, ServerRank: serverRank, KindRank: kindRank}
 	}
 
 	eventKind := eventKinds[m["event_type"]]
@@ -145,6 +164,7 @@ func activityRecord(m map[string]string, source store.ActivitySource) activityFa
 			Channel:     channel,
 			Guild:       guild,
 			Kind:        kind,
+			KindRank:    kindRank,
 			Time:        at,
 			Platform:    client,
 			Length:      activityCount(m["length"]),

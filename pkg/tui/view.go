@@ -571,10 +571,16 @@ func calendarAge(date string, today time.Time) string {
 func displayChannel(r store.Row) string {
 	name := session.Safe(r.Name)
 	if r.Kind == "unknown-dm" {
-		return "Unknown participant"
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if name == "" || name == r.Channel || strings.Contains(lower, "unknown participant") || lower == "deleted user" || strings.HasSuffix(lower, "with deleted user") {
+			return "Unknown participant"
+		}
 	}
-	if r.Kind == "dm" {
-		name = strings.TrimPrefix(name, "Direct Message with ")
+	if r.Kind == "dm" || r.Kind == "unknown-dm" {
+		const prefix = "direct message with "
+		if strings.HasPrefix(strings.ToLower(name), prefix) {
+			name = strings.TrimSpace(name[len(prefix):])
+		}
 		if head, tail, ok := strings.Cut(name, "#"); ok && tail != "" && strings.Trim(tail, "0123456789") == "" {
 			name = head
 		}
