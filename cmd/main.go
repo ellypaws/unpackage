@@ -126,6 +126,13 @@ func run() error {
 				}
 				maps.Copy(s.Filter.IncidentSeconds, seconds)
 			}
+		case "--violations":
+			report, e := session.ReadSafety(val)
+			if e != nil {
+				return e
+			}
+			s.Safety.Merge(report)
+			s.FilterViolations(s.Safety)
 		case "--search":
 			s.Filter.Search = val
 		case "--media":

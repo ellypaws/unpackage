@@ -11,6 +11,7 @@ import (
 
 	"github.com/ellypaws/unpackage/pkg/importer"
 	"github.com/ellypaws/unpackage/pkg/logging"
+	"github.com/ellypaws/unpackage/pkg/safety"
 	"github.com/ellypaws/unpackage/pkg/store"
 )
 
@@ -22,6 +23,7 @@ type Session struct {
 	wg     sync.WaitGroup
 	files  chan struct{}
 	Filter store.Filter
+	Safety safety.Report
 	Today  time.Time
 }
 type importJob struct {

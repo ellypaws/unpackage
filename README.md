@@ -81,16 +81,6 @@ The server picker sorts by message count. Use the sort control to switch to name
 Activate a server once to include it, again to exclude it, and a third time to clear it. If any
 servers are included, only those servers are eligible. Excluded servers are always removed.
 
-Use `Paste from clipboard` in the Investigate tab after copying a Discord safety-notice message
-response. This avoids terminals that replay Ctrl+V input synchronously. Recognized responses add
-every `incident_time` to the exact-second message filter, so repeated pastes accumulate and
-duplicate times are ignored. Clipboard contents are processed in memory and are not shown in the
-command console or written to logs. On Linux the app tries `wl-paste`, `xclip`, `xsel`, and on WSL
-`powershell.exe`, in that order, so install `wl-clipboard`, `xclip`, or `xsel` if none are present.
-If the clipboard still cannot be read, type the unix seconds into the
-date box instead, for example `1700000000; 1700000060`. Whole numbers above 100000 are treated as
-unix times rather than days ago, and each entry is added to the exact-second filter.
-
 The package browser keeps parent folders visible in columns. Hover a narrow column to expand it.
 Type part of a folder name to filter and highlight fuzzy matches, then use `Tab` to complete the
 first match. A trailing slash enters a directory. Single-click a folder to open it, or double-click
@@ -100,6 +90,43 @@ finish and hide when space is limited.
 
 The older and newer browsers share their starting location until each has a selected package.
 After that, each remembers its own location for the current session.
+
+## Violations
+
+The Violations tab reads two Discord responses you copy from your browser's developer tools:
+
+- `safety-hub/@me`, the Account Standing page. It lists each violation with its classification
+  type, actions taken, appeal status, expiry, and sometimes the flagged message and its ID.
+- `messages` from your direct messages with the official Discord account. Its safety notices give
+  the exact second of each incident, and system notifications report appeal outcomes.
+
+`How to copy` in the tab walks through the steps for Chrome, Edge, Firefox, Safari, and other
+Chromium browsers. Copy the response body only. The request headers contain your login token.
+
+Notices and Safety Hub entries are joined by classification ID, so pasting both gives the fullest
+picture. Repeated pastes add up and duplicates are ignored. The tab shows account standing, filters
+by appeal state, account or server scope, and whether matching messages were found, and lists the
+loaded messages each violation points to. Violations stay for the session even after Investigate
+filters are reset. Nothing is saved to disk.
+
+The counts under the standing scale filter the list by state. Each violation's details open with
+what it means for you now and how to appeal it, then a timeline from incident to expiry. `Copy
+summary` copies a plain-text summary with the classification and message IDs for an appeal or a
+support request. On wide terminals, hovering a violation previews its details.
+
+Messages identified by a violation carry a `violation` mark in Investigate, Stats message lists,
+and message details. The mark reads `violation removed` or `violation expired` when that applies.
+Hover the mark for a summary, or activate it to open the violation.
+
+`Paste from clipboard` reads the clipboard directly, which avoids terminals that replay Ctrl+V input
+synchronously. In Investigate, a paste also narrows results to the flagged messages and exact
+incident seconds it contains. In Violations it only adds to the list. Clipboard contents are
+processed in memory and are not shown in the command console or written to logs. On Linux the app
+tries `wl-paste`, `xclip`, `xsel`, and on WSL `powershell.exe`, in that order, so install
+`wl-clipboard`, `xclip`, or `xsel` if none are present. If the clipboard still cannot be read, save
+the response to a file and run `violations "response.json"` in the Console tab, or type the unix
+seconds into the date box, for example `1700000000; 1700000060`. Whole numbers above 100000 are
+treated as unix times rather than days ago, and each entry is added to the exact-second filter.
 
 ## Try it without a Discord export
 
@@ -133,6 +160,8 @@ list jsonl
 ```
 
 Use `summary`, `leaders servers missing`, or `heatmap voice-time all` for statistics in the console.
+Use `violations "response.json"` to load a saved Safety Hub or notice response, `violations` to list
+what is loaded, and `violations clear` to remove it.
 Use `show MESSAGE_ID` for a complete row. Use `list jsonl` or `list tsv` to export the current
 results. Use `clear` to reset filters and `stop` to stop an import while keeping data already read.
 
@@ -190,12 +219,13 @@ unpackage.exe diff "C:\Exports\older.zip" "C:\Exports\newer" > missing.jsonl
 ```
 
 Add `--format tsv` for tab-separated output. You can also use `--server ID`,
-`--exclude-server ID`, `--date DATE`, `--search TEXT`, `--media all|attachments|media`, and
-`--mode missing|all|older|newer|present`.
+`--exclude-server ID`, `--date DATE`, `--search TEXT`, `--media all|attachments|media`,
+`--violations FILE`, and `--mode missing|all|older|newer|present`. `--violations` limits results to
+the messages a saved Safety Hub or notice response identifies.
 
 ## Keyboard shortcuts
 
-`Tab` and `Shift+Tab` move focus. `Enter` activates a control. `Ctrl+Tab` switches tabs. In the
+The bottom line lists the keys that act on whatever has focus. `Tab` and `Shift+Tab` move focus. `Enter` activates a control. `Ctrl+Tab` switches tabs. In the
 Stats tab, arrow keys move across the activity grid once it has focus and scroll the leader list. `F1`
 opens help. `Ctrl+O`, `Ctrl+N`, and `Ctrl+D` open the older package, newer package, and calendar
 controls. `Ctrl+X` stops an import, `Esc` closes an open panel, and `Ctrl+C` exits.

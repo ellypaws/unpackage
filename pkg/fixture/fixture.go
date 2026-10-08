@@ -121,6 +121,64 @@ func Generate(dir string, count int) error {
 			return e
 		}
 	}
+	return safety(dir)
+}
+
+// safety writes fictional Safety Hub and system DM responses that point at sample messages.
+func safety(dir string) error {
+	at := func(i int) time.Time { return time.Date(2022, 11, 15, 12, 0, 0, 0, time.UTC).AddDate(0, 0, i%30) }
+	snowflake := func(t time.Time, n int) string {
+		return strconv.FormatUint(uint64(t.UnixMilli()-1420070400000)<<22|uint64(n), 10)
+	}
+	hate, spam, guild, removed := snowflake(at(0).Add(5*time.Minute), 1), snowflake(at(7).Add(9*time.Minute), 2), snowflake(at(12), 3), snowflake(at(20).Add(time.Hour), 4)
+	expires := func(t time.Time) *string { return new(t.Format(time.RFC3339Nano)) }
+	action := func(id string, kind int, text string) map[string]any {
+		return map[string]any{"id": id, "action_type": kind, "descriptions": []string{text}}
+	}
+	hub := map[string]any{
+		"classifications": []any{
+			map[string]any{"id": hate, "classification_type": 220, "description": "Hateful conduct", "explainer_link": "https://example.invalid/policy/hateful-conduct", "actions": []any{action(snowflake(at(0), 11), 4, "A warning was added to the account."), action(snowflake(at(0), 12), 16, "The message was removed.")}, "max_expiration_time": expires(at(0).AddDate(1, 0, 0)), "flagged_content": []any{map[string]any{"type": "message", "id": snowflake(at(0), 0), "content": "Synthetic message 0", "attachments": []any{map[string]string{"filename": "file.png"}}}}, "appeal_status": map[string]int{"status": 1}, "is_coppa": false, "is_spam": false, "appeal_ingestion_type": 2},
+			map[string]any{"id": spam, "classification_type": 3030, "description": "", "explainer_link": "https://example.invalid/policy/spam", "actions": []any{action(snowflake(at(7), 13), 7, "The message was marked as spam.")}, "max_expiration_time": expires(at(7).AddDate(0, 6, 0)), "flagged_content": []any{}, "appeal_status": map[string]int{"status": 2}, "is_coppa": false, "is_spam": true, "appeal_ingestion_type": 0},
+			map[string]any{"id": removed, "classification_type": 5411, "description": "Minimum age requirement", "explainer_link": "https://example.invalid/policy/age", "actions": []any{action(snowflake(at(20), 14), 9, "Some features were limited.")}, "max_expiration_time": nil, "flagged_content": []any{}, "appeal_status": map[string]int{"status": 3}, "is_coppa": true, "is_spam": false, "appeal_ingestion_type": 1},
+		},
+		"guild_classifications": []any{
+			map[string]any{"id": guild, "classification_type": 5305, "description": "Member of a server that shared personal information", "explainer_link": "https://example.invalid/policy/doxxing", "actions": []any{action(snowflake(at(12), 15), 15, "Server access was limited.")}, "max_expiration_time": expires(at(12).AddDate(0, 1, 0)), "flagged_content": []any{}, "is_coppa": false, "is_spam": false, "appeal_ingestion_type": 0, "guild_metadata": map[string]any{"name": "Sample Workshop", "icon": nil, "member_type": 2}},
+		},
+		"account_standing":   map[string]int{"state": 200},
+		"is_dsa_eligible":    true,
+		"is_appeal_eligible": true,
+		"username":           "synthetic",
+		"appeal_eligibility": []int{2, 1},
+	}
+	field := func(name, value string) map[string]any {
+		return map[string]any{"name": name, "value": value, "inline": false}
+	}
+	notice := func(id, classification string, incident time.Time) map[string]any {
+		return map[string]any{"id": id, "type": 0, "content": "", "embeds": []any{map[string]any{"type": "safety_policy_notice", "title": "You broke Discord's community guidelines", "fields": []any{
+			field("client_version_message", "To see the details of this violation, please update the app or open Discord in your browser."),
+			field("classification_id", classification),
+			field("incident_time", strconv.FormatInt(incident.Unix(), 10)+".0"),
+		}}}}
+	}
+	notices := []any{
+		map[string]any{"id": snowflake(at(21), 23), "type": 0, "content": "", "embeds": []any{map[string]any{"type": "safety_system_notification", "title": "Important message from Discord regarding your account", "fields": []any{
+			field("body", "We reviewed a violation regarding our minimum age requirements policy and determined it does not violate our community guidelines."),
+			field("header", "We have removed a violation from your account"),
+			field("timestamp", strconv.FormatInt(at(21).Unix(), 10)+".703625"),
+			field("classification_id", removed),
+		}}}},
+		notice(snowflake(at(7).Add(10*time.Minute), 22), spam, at(7)),
+		notice(snowflake(at(0).Add(6*time.Minute), 21), hate, at(0)),
+	}
+	for name, v := range map[string]any{"safety-hub.json": hub, "safety-notices.json": notices} {
+		data, e := json.MarshalIndent(v, "", "  ")
+		if e != nil {
+			return e
+		}
+		if e = os.WriteFile(filepath.Join(dir, name), data, 0600); e != nil {
+			return e
+		}
+	}
 	return nil
 }
 func errorsClose(f *os.File, e error) error {

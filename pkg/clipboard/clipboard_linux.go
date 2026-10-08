@@ -26,6 +26,39 @@ var tools = []tool{
 	{"termux-clipboard-get", nil, nil},
 }
 
+var writers = []tool{
+	{"wl-copy", nil, func() bool { return os.Getenv("WAYLAND_DISPLAY") != "" }},
+	{"xclip", []string{"-in", "-selection", "clipboard"}, func() bool { return os.Getenv("DISPLAY") != "" }},
+	{"xsel", []string{"--input", "--clipboard"}, func() bool { return os.Getenv("DISPLAY") != "" }},
+	{"clip.exe", nil, nil},
+	{"termux-clipboard-set", nil, nil},
+}
+
+// Write sends text to the first installed clipboard tool that accepts it.
+func Write(ctx context.Context, text string) error {
+	var failures []string
+	for _, t := range writers {
+		if t.available != nil && !t.available() {
+			continue
+		}
+		path, err := exec.LookPath(t.name)
+		if err != nil {
+			continue
+		}
+		cmd := exec.CommandContext(ctx, path, t.args...)
+		cmd.Stdin = strings.NewReader(text)
+		if err = cmd.Run(); err != nil {
+			failures = append(failures, t.name+": "+describe(err))
+			continue
+		}
+		return nil
+	}
+	if len(failures) == 0 {
+		return errors.New("no clipboard tool found; install wl-clipboard, xclip, or xsel")
+	}
+	return fmt.Errorf("%s", strings.Join(failures, "; "))
+}
+
 // Read tries each installed clipboard tool in order and returns the first
 // non-empty text. Tools are tried at call time, so a tool that fails for one
 // clipboard state does not block the others.

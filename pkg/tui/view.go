@@ -102,7 +102,7 @@ func (m *Model) workLabel() string {
 		return "Searching servers…"
 	}
 	if m.Tab == tabInvestigate && (m.SearchInput.Value() != m.Session.Filter.Search || m.Loading && m.Session.Filter.Search != "") {
-		if len(m.Session.Filter.IncidentSeconds) > 0 {
+		if len(m.Session.Filter.IncidentSeconds) > 0 || len(m.Session.Filter.IncidentIDs) > 0 {
 			return "Finding messages at exact times…"
 		}
 		return "Searching messages…"
@@ -206,16 +206,7 @@ func (m *Model) statusLine(width int) string {
 	if text == "" || text == "Done" {
 		return ""
 	}
-	style := lipgloss.NewStyle().Foreground(components.Accent)
-	lower := strings.ToLower(text)
-	if strings.HasPrefix(lower, "applied ") || strings.HasPrefix(lower, "saved ") {
-		style = style.Foreground(components.Green).Bold(true)
-	} else if strings.Contains(lower, "invalid") || strings.Contains(lower, "error") || strings.Contains(lower, "cannot") || strings.Contains(lower, "has no ") || strings.Contains(lower, "exceeds") {
-		style = style.Foreground(components.Deleted)
-	} else if strings.HasPrefix(lower, "stopping") || strings.HasPrefix(lower, "choose ") {
-		style = components.Warn
-	}
-	return style.Render(components.Fit(text, width))
+	return m.styledNotice(text, width)
 }
 
 func (m *Model) appTitle(width int) string {
@@ -286,10 +277,20 @@ func (m *Model) View() string {
 		return m.modal("Deletion request", body)
 	}
 	var tabs []string
-	for i, name := range []string{"Investigate", "Stats", "Console", "Log"} {
+	violationTab := "Violations"
+	if n := len(m.Session.Safety.Violations); n > 0 {
+		violationTab += " " + number(n)
+		m.Tips[fmt.Sprintf("tab-%d", tabViolations)] = m.violationOverview()
+	}
+	names := []string{"Investigate", violationTab, "Stats", "Console", "Log"}
+	padding := 2
+	for padding > 0 && len(names)*(2*padding+2)+lipgloss.Width(strings.Join(names, "")) > w {
+		padding--
+	}
+	for i, name := range names {
 		id := fmt.Sprintf("tab-%d", i)
 		m.Actions = append(m.Actions, id)
-		tabs = append(tabs, components.Tab(m.Zones, id, name, m.Hover, m.Focus, m.Tab == i, 2))
+		tabs = append(tabs, components.Tab(m.Zones, id, name, m.Hover, m.Focus, m.Tab == i, padding))
 	}
 	tabRow := lipgloss.JoinHorizontal(lipgloss.Bottom, tabs...)
 	tabRow += components.Separator(max(0, w-lipgloss.Width(tabRow)))
@@ -340,12 +341,20 @@ func (m *Model) View() string {
 		metadata := lipgloss.NewStyle().Foreground(components.Muted).Render(strings.Join(metadataLines, "\n"))
 		contentWidth := max(1, w-4)
 		content := styledMessageLocation(*r, contentWidth, components.Accent, -1, false, true) + "\n\n" + dateDetails + "\n\n" + components.TitleRule("Message content", contentWidth, m.Frame, false) + "\n" + messageContent + "\n\n" + components.TitleRule("Attachments", contentWidth, m.Frame, false) + "\n" + attachments + "\n\n" + metadata
+		controls := m.button("detail-close", "Back", false)
+		if v, ok := m.rowViolation(*r); ok {
+			content += "\n\n" + components.TitleRule("Violation", contentWidth, m.Frame, false) + "\n" + m.violationSummary(v, contentWidth)
+			controls += " " + m.button("violation-detail", "Open violation", false)
+		}
+		controls += " " + m.button("detail-copy", "Copy message ID", false)
 		m.Viewport.SetContent(lipgloss.NewStyle().Width(w - 4).Render(content))
-		body = m.button("detail-close", "Back to results", false) + "\n\n" + m.Viewport.View()
+		body = controls + "\n\n" + m.Viewport.View()
 	} else {
 		switch m.Tab {
 		case tabInvestigate:
 			body = m.investigate(w, h)
+		case tabViolations:
+			body = m.violations(w, h)
 		case tabStats:
 			body = m.stats(w, h)
 		case tabConsole:
@@ -373,7 +382,7 @@ func (m *Model) View() string {
 			body = m.button("log-follow", "Follow latest", m.FollowLog) + "\n\n" + m.Viewport.View()
 		}
 	}
-	footer := m.statusLine(w)
+	footer := m.footer(w)
 	if m.Tab == tabConsole {
 		footer = m.field("command", &m.Input, w) + "\n" + footer
 	}
@@ -495,7 +504,7 @@ func (m *Model) messageDate(id, date string, color lipgloss.Color) string {
 	label := relativeDate(date, m.Session.Today)
 	messageTime, err := time.Parse(time.RFC3339Nano, date)
 	if m.Hover == id {
-		if err == nil && len(m.Session.Filter.IncidentSeconds) > 0 {
+		if err == nil && (len(m.Session.Filter.IncidentSeconds) > 0 || len(m.Session.Filter.IncidentIDs) > 0 || len(m.Session.Safety.Violations) > 0) {
 			label = messageTime.In(time.Local).Format("2006-01-02 15:04:05.000 -07:00")
 		} else {
 			label = store.LocalDate(date)
@@ -629,19 +638,23 @@ func (m *Model) filters(w int) string {
 	if tokens := m.searchTokens(w); tokens != "" {
 		parts = append(parts, tokens)
 	}
-	parts = append(parts, components.Title.Render("Message dates"), m.button("clipboard", "Paste from clipboard", false), m.field("days-input", &m.DayInput, min(34, w)))
+	m.Tips["clipboard"] = "Read a copied Safety Hub or safety notice response. Matching messages replace the date filter."
+	paste := m.button("clipboard", "Paste from clipboard", false)
+	if len(m.Session.Safety.Violations) > 0 && len(m.Session.Filter.IncidentSeconds) == 0 && len(m.Session.Filter.IncidentIDs) == 0 && m.enabled("safety-investigate") {
+		m.Tips["safety-investigate"] = "Show every message the loaded violations identify"
+		if show := m.button("safety-investigate", "Violations", false); lipgloss.Width(paste)+1+lipgloss.Width(show) <= w {
+			paste += " " + show
+		} else {
+			paste += "\n" + show
+		}
+	}
+	parts = append(parts, components.Title.Render("Message dates"), paste, m.field("days-input", &m.DayInput, min(34, w)))
 	parts = append(parts, m.button("dates", "Choose dates", false)+" "+m.button("dates-clear", "Clear", false))
 	parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Separate multiple dates with ;"))
 	dates := m.Session.Filter.Dates
-	incidents := m.Session.Filter.IncidentSeconds
-	if len(incidents) > 0 {
-		label := fmt.Sprintf("%d exact incident times", len(incidents))
-		if len(incidents) == 1 {
-			for second := range incidents {
-				label = "Exact: " + time.Unix(second, 0).In(time.Local).Format("2006-01-02 15:04:05")
-			}
-		}
-		parts = append(parts, lipgloss.NewStyle().Foreground(components.Accent).Render(label))
+	if label := m.incidentLabel(); label != "" {
+		m.Tips["view-violations"] = "Open the Violations tab"
+		parts = append(parts, m.button("view-violations", components.Fit(label, w-3), true))
 	} else if len(dates) == 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(components.Muted).Render("Any date"))
 	} else {
@@ -660,7 +673,7 @@ func (m *Model) filters(w int) string {
 	}
 	f := m.Session.Filter
 	margin := "Exact dates"
-	if len(f.IncidentSeconds) > 0 {
+	if len(f.IncidentSeconds) > 0 || len(f.IncidentIDs) > 0 {
 		margin = "Exact incident seconds"
 	}
 	if f.DateBefore > 0 || f.DateAfter > 0 {
@@ -699,8 +712,8 @@ func (m *Model) results(w, h int) string {
 	}
 	if !m.wide() {
 		label := "Dates & filters"
-		if len(m.Session.Filter.IncidentSeconds) > 0 {
-			label = fmt.Sprintf("Times & filters: %d", len(m.Session.Filter.IncidentSeconds))
+		if n := len(m.Session.Filter.IncidentSeconds) + len(m.Session.Filter.IncidentIDs); n > 0 {
+			label = fmt.Sprintf("Times & filters: %d", n)
 		} else if len(m.Session.Filter.Dates) > 0 {
 			label = fmt.Sprintf("Dates & filters: %d", len(m.Session.Filter.Dates))
 		}
@@ -714,11 +727,14 @@ func (m *Model) results(w, h int) string {
 	}
 	total := m.resultCount()
 	label := "messages"
-	if m.Session.Filter.Mode == "missing" || len(m.Rows) > 0 && m.Rows[0].ContentUnavailable() && len(m.Session.Filter.IncidentSeconds) == 0 {
+	if m.Session.Filter.Mode == "missing" || len(m.Rows) > 0 && m.Rows[0].ContentUnavailable() && len(m.Session.Filter.IncidentSeconds) == 0 && len(m.Session.Filter.IncidentIDs) == 0 {
 		label = "missing messages"
 	}
 	if total == 1 {
 		label = strings.TrimSuffix(label, "s")
+	}
+	if m.incidentLabel() != "" && len(m.Session.Safety.Violations) > 0 {
+		label = map[bool]string{true: "message linked to violations", false: "messages linked to violations"}[total == 1]
 	}
 	titleText := number(total) + " " + label
 	if total > 0 {
@@ -786,7 +802,7 @@ func (m *Model) packageSummary() string {
 }
 
 func messageIndex(id string) (int, bool) {
-	for _, prefix := range []string{"row-server-", "row-date-", "row-"} {
+	for _, prefix := range []string{"violation-row-", "row-server-", "row-date-", "row-"} {
 		value, ok := strings.CutPrefix(id, prefix)
 		if !ok {
 			continue
@@ -856,6 +872,9 @@ func (m *Model) messages(w, h int) string {
 			media = ", attachment"
 		}
 		date := m.messageDate(fmt.Sprintf("row-date-%d", i), r.Date, mutedColor) + lipgloss.NewStyle().Foreground(mutedColor).Render(media)
+		if badge := m.violationBadge(fmt.Sprintf("violation-row-%d", i), r, distance); badge != "" {
+			date = badge + "  " + date
+		}
 		metaWidth := listWidth - 4
 		if action != "" {
 			metaWidth -= lipgloss.Width(action) + 1

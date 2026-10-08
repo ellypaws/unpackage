@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ellypaws/unpackage/pkg/components"
+	"github.com/ellypaws/unpackage/pkg/safety"
 	"github.com/ellypaws/unpackage/pkg/session"
 	"github.com/ellypaws/unpackage/pkg/store"
 )
@@ -616,8 +617,7 @@ func (m *Model) card(id, title, body string, width int) string {
 		title = "\u25b8\ufe0e " + title
 		border = components.Accent
 		titleColor = components.Accent
-		moreID := "stats-more-" + strings.TrimPrefix(id, "stats-open-")
-		if m.Hover == id || m.Focus == id || m.Hover == moreID || m.Focus == moreID {
+		if m.Hover == id || m.Focus == id {
 			border = components.Cyan
 			titleColor = lipgloss.Color("#FFFFFF")
 		}
@@ -694,10 +694,9 @@ func (m *Model) boardCard(spec boardSpec, width int, limit int) string {
 		labelWidth := max(4, inner-lipgloss.Width(value)-1)
 		label = components.Fit(label, labelWidth)
 		line := label + strings.Repeat(" ", max(1, labelWidth-lipgloss.Width(label)+1)) + value
-		cardID := "stats-open-" + string(spec.entity) + "/" + spec.metric.Key()
 		moreID := "stats-more-" + string(spec.entity) + "/" + spec.metric.Key()
 		style := lipgloss.NewStyle().Foreground(components.Accent).Bold(true)
-		if m.Hover == cardID || m.Focus == cardID || m.Hover == moreID || m.Focus == moreID {
+		if m.Hover == moreID || m.Focus == moreID {
 			style = style.Foreground(lipgloss.Color("#FFFFFF")).Background(components.SurfaceHover).Underline(true)
 		}
 		m.HoverOnly = append(m.HoverOnly, moreID)
@@ -817,6 +816,13 @@ func (m *Model) overview(w, h int) string {
 		community = append(community, tile{"Top emoji", leaderName(top[0]), metricUnit(store.MetricReactions, top[0].Values[store.MetricReactions]), top[0].Values[store.MetricReactions]})
 	}
 	community = append(community, count(store.MetricEdits), tile{"Deletions", number(st.Totals[store.MetricDeletions]), "deletions recorded by Discord analytics, not the older versus newer comparison", st.Totals[store.MetricDeletions]})
+	if report := m.Session.Safety; len(report.Violations) > 0 || report.HubLoaded {
+		tip := "violations loaded from Discord safety responses, across all time"
+		if report.HubLoaded {
+			tip = "account standing " + strings.ToLower(safety.StandingLabel(report.Standing)) + ", " + tip
+		}
+		community = append(community, tile{"Violations", number(len(report.Violations)), tip, len(report.Violations)})
+	}
 	compact := h < 22
 	rows := []string{m.tileCard("Messages", messages, cw, compact)}
 	if note := m.importNote(); note != "" {
@@ -1036,7 +1042,7 @@ func (m *Model) statsMessages(w, h int) string {
 		cw = w - 2
 	}
 	active := -1
-	if i, ok := hoverIndex(m.Hover, "srow-", "sdate-"); ok {
+	if i, ok := hoverIndex(m.Hover, "violation-srow-", "srow-", "sdate-"); ok {
 		active = i
 	}
 	lines := []string{title + "  " + muted.Render(fmt.Sprintf("%s, newest first, %d to %d", metricUnit(store.MetricMessages, m.StatsTotal), m.StatsOffset+1, end))}
@@ -1066,6 +1072,9 @@ func (m *Model) statsMessages(w, h int) string {
 			media = ", attachment"
 		}
 		date := m.messageDate(fmt.Sprintf("sdate-%d", i), r.Date, mutedColor) + lipgloss.NewStyle().Foreground(mutedColor).Render(media)
+		if badge := m.violationBadge(fmt.Sprintf("violation-srow-%d", i), r, distance); badge != "" {
+			date = badge + "  " + date
+		}
 		metaWidth := cw - 4
 		nameWidth := max(8, metaWidth-lipgloss.Width(date)-2)
 		name := styledMessageLocation(r, nameWidth, metaColor, distance, hover, false)

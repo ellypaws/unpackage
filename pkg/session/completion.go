@@ -152,12 +152,12 @@ func CompleteCommand(text string, catalog store.SearchCatalog, history []string)
 	if !hasArg {
 		for line := range strings.SplitSeq(Help, "\n") {
 			fields := strings.Fields(line)
-			if len(fields) > 0 && slices.Contains([]string{"open", "wait", "stop", "status", "mode", "servers", "select", "exclude", "dates", "margin", "last", "before", "search", "channel", "kind", "media", "clear", "list", "show", "stats", "days", "summary", "leaders", "heatmap", "request", "help", "quit"}, fields[0]) {
+			if len(fields) > 0 && slices.Contains([]string{"open", "wait", "stop", "status", "mode", "servers", "select", "exclude", "dates", "margin", "last", "before", "search", "channel", "kind", "media", "clear", "list", "show", "stats", "days", "summary", "leaders", "heatmap", "violations", "request", "help", "quit"}, fields[0]) {
 				add(fields[0] + " ")
 			}
 		}
 	} else {
-		values := map[string][]string{"open": {"older ", "newer "}, "mode": {"auto", "missing", "all", "older", "newer", "present", "new"}, "kind": {"guild", "dm", "group", "unknown-dm", "unknown", "conflict", "all"}, "media": {"all", "attachments", "media"}, "list": {"jsonl", "tsv"}, "dates": {"clear"}, "summary": {"all"}, "leaders": {"servers ", "channels ", "people ", "games ", "platforms ", "emoji "}, "heatmap": {"messages all", "voice-time all", "play-time all"}}
+		values := map[string][]string{"open": {"older ", "newer "}, "mode": {"auto", "missing", "all", "older", "newer", "present", "new"}, "kind": {"guild", "dm", "group", "unknown-dm", "unknown", "conflict", "all"}, "media": {"all", "attachments", "media"}, "list": {"jsonl", "tsv"}, "dates": {"clear"}, "violations": {"clear"}, "summary": {"all"}, "leaders": {"servers ", "channels ", "people ", "games ", "platforms ", "emoji "}, "heatmap": {"messages all", "voice-time all", "play-time all"}}
 		for _, value := range values[command] {
 			add(command + " " + value)
 		}

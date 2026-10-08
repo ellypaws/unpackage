@@ -54,6 +54,8 @@ leaders ENTITY [METRIC] [DAYS|all]
                            ENTITY servers|channels|people|games|platforms|emoji
                            METRIC messages|missing|media|voice|voice-time|play-time|sessions|reactions|streams
 heatmap [METRIC] [DAYS|all]  Weekday by hour grid
+violations ["response.json"|clear]
+                           List violations, or load a copied Safety Hub or notice response
 request "draft.txt" all|filtered
 help                       Command reference
 quit                       Exit
@@ -63,6 +65,7 @@ CLI: package diff OLDER NEWER [options]
   --date "days, date, or unix time"   --search TEXT
   --media all|attachments|media
   --before-days N   --after-days N
+  --violations FILE   Messages matching a saved safety response
   --mode MODE   --format jsonl|tsv
   --request FILE   --scope all|filtered
 package repl
@@ -70,7 +73,7 @@ package sample DIRECTORY [MESSAGE_COUNT]
 
 Dates use local time. Quote paths with spaces.
 Statistics commands use the included and excluded servers and combine both packages.
-Use Paste from clipboard in Investigate to filter exact incident seconds.
+Use Paste from clipboard in Investigate or Violations to load Discord safety responses.
 Request requires an included or excluded server; all ignores other filters.
 Missing means absent from the newer export, not proof of deletion.`
 
@@ -191,6 +194,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		if arg == "clear" {
 			s.Filter.Dates = nil
 			s.Filter.IncidentSeconds = nil
+			s.Filter.IncidentIDs = nil
 		} else {
 			d, seconds, e := Dates(arg, s.Today)
 			if e != nil {
@@ -198,6 +202,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 			}
 			s.Filter.Dates = d
 			s.Filter.IncidentSeconds = seconds
+			s.Filter.IncidentIDs = nil
 		}
 		s.Filter.From = ""
 		s.Filter.Until = ""
@@ -209,6 +214,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		}
 		s.Filter.Dates = nil
 		s.Filter.IncidentSeconds = nil
+		s.Filter.IncidentIDs = nil
 		s.Filter.From = s.Today.AddDate(0, 0, 1-n).Format(time.DateOnly)
 		s.Filter.Until = s.Today.AddDate(0, 0, 1).Format(time.DateOnly)
 	case "margin":
@@ -231,6 +237,7 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		}
 		s.Filter.Dates = nil
 		s.Filter.IncidentSeconds = nil
+		s.Filter.IncidentIDs = nil
 		s.Filter.From = ""
 		s.Filter.Until = arg
 	case "search":
@@ -300,6 +307,8 @@ func (s *Session) Execute(ctx context.Context, a []string, w io.Writer) error {
 		}
 	case "summary", "leaders", "heatmap":
 		return s.Statistics(ctx, a, w)
+	case "violations":
+		return s.violations(arg, w)
 	case "request":
 		if e := need(3); e != nil {
 			return e

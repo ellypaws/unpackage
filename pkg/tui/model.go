@@ -18,6 +18,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/ellypaws/unpackage/pkg/components"
+	"github.com/ellypaws/unpackage/pkg/safety"
 	"github.com/ellypaws/unpackage/pkg/session"
 	"github.com/ellypaws/unpackage/pkg/store"
 )
@@ -29,8 +30,12 @@ type searchMsg struct {
 	Revision int
 	Value    string
 }
+type copiedMsg struct {
+	Label string
+	Err   error
+}
 type incidentInputMsg struct {
-	Seconds    map[int64]int64
+	Report     safety.Report
 	Recognized bool
 	Clipboard  bool
 	Err        error
@@ -39,6 +44,7 @@ type incidentInputMsg struct {
 
 const (
 	tabInvestigate = iota
+	tabViolations
 	tabStats
 	tabConsole
 	tabLog
@@ -162,6 +168,17 @@ type Model struct {
 	ChannelLabel                                  string
 	HeatCursor                                    [2]int
 	Tips                                          map[string]string
+	SafetyIndex                                   safety.Index
+	SafetyMatches                                 map[string][]store.Row
+	SafetyRevision, SafetyRowsRevision            int
+	SafetyRowsLoading, SafetyDirty                bool
+	SafetySelected                                string
+	SafetyState, SafetyScope, SafetyFound         string
+	SafetyGuide, SafetyDetail                     bool
+	SafetyBrowser                                 string
+	SafetyOffset, SafetyPage                      int
+	SafetyArrivals                                map[string]time.Time
+	SafetyStandingAt, NoticeAt                    time.Time
 }
 
 func New(ctx context.Context, s *session.Session) *Model {
@@ -247,6 +264,7 @@ func (m *Model) refresh() tea.Cmd {
 	f.ExcludedGuilds = slices.Clone(f.ExcludedGuilds)
 	f.Dates = slices.Clone(f.Dates)
 	f.IncidentSeconds = maps.Clone(f.IncidentSeconds)
+	f.IncidentIDs = slices.Clone(f.IncidentIDs)
 	f.Limit = m.pageSize()
 	f.Offset = m.Offset
 	revision := m.Revision
@@ -265,7 +283,7 @@ func (m *Model) refresh() tea.Cmd {
 		full := f
 		full.Limit = 0
 		full.Offset = 0
-		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), IncidentSeconds: maps.Clone(full.IncidentSeconds), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
+		matchingFilter := store.Filter{Mode: full.Mode, Dates: slices.Clone(full.Dates), IncidentSeconds: maps.Clone(full.IncidentSeconds), IncidentIDs: slices.Clone(full.IncidentIDs), From: full.From, Until: full.Until, DateBefore: full.DateBefore, DateAfter: full.DateAfter}
 		missingFilter := matchingFilter
 		missingFilter.Mode = "missing"
 		var filtered, matching, missing []store.Row
@@ -273,7 +291,7 @@ func (m *Model) refresh() tea.Cmd {
 		var group sync.WaitGroup
 		group.Go(func() { filtered, errs[0] = s.Rows(ctx, full) })
 		sameMatching := full.Search == "" && full.Channel == "" && full.Kind == "" && full.Media == "" && len(full.Guilds) == 0 && len(full.ExcludedGuilds) == 0 && len(full.ChannelTypes) == 0 && len(full.ExcludedChannelTypes) == 0 && !full.HideEventOnly
-		sameMissing := matchingFilter.Mode == "missing" || comparable && (matchingFilter.Mode == "auto" || matchingFilter.Mode == "") && len(matchingFilter.IncidentSeconds) == 0
+		sameMissing := matchingFilter.Mode == "missing" || comparable && (matchingFilter.Mode == "auto" || matchingFilter.Mode == "") && len(matchingFilter.IncidentSeconds) == 0 && len(matchingFilter.IncidentIDs) == 0
 		if !sameMatching {
 			group.Go(func() { matching, errs[1] = s.Rows(ctx, matchingFilter) })
 		}
@@ -316,7 +334,7 @@ func (m *Model) refresh() tea.Cmd {
 			d.Servers[i].Count = counts[d.Servers[i].ID]
 			d.Servers[i].Missing = missingCounts[d.Servers[i].ID]
 		}
-		if len(full.Dates) > 0 || len(full.IncidentSeconds) > 0 || full.From != "" || full.Until != "" {
+		if len(full.Dates) > 0 || len(full.IncidentSeconds) > 0 || len(full.IncidentIDs) > 0 || full.From != "" || full.Until != "" {
 			d.Servers = slices.DeleteFunc(d.Servers, func(group store.Group) bool { return group.Count == 0 })
 		}
 		return d

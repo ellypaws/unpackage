@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -14,15 +13,31 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/ellypaws/unpackage/pkg/clipboard"
 	"github.com/ellypaws/unpackage/pkg/components"
-	"github.com/ellypaws/unpackage/pkg/importer"
+	"github.com/ellypaws/unpackage/pkg/safety"
 	"github.com/ellypaws/unpackage/pkg/session"
 	"github.com/ellypaws/unpackage/pkg/store"
 )
 
+// Update stamps every notice change so the status line can hold it and then fade it.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	notice := m.Notice
+	model, cmd := m.update(msg)
+	if m.Notice != notice {
+		m.NoticeAt = time.Now()
+	}
+	return model, cmd
+}
+
+func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case copiedMsg:
+		if v.Err != nil {
+			m.Notice = "Cannot copy: " + v.Err.Error()
+		} else {
+			m.Notice = "Copied " + v.Label
+		}
+		return m, nil
 	case scrollMsg:
 		if v.Revision != m.ScrollRevision || !m.ScrollPending {
 			return m, nil
@@ -60,31 +75,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if !v.Recognized {
-			m.Notice = "Pasted JSON has no Discord incident times"
+			m.Notice = "Pasted JSON has no Discord safety data"
 			if v.Clipboard {
-				m.Notice = "Clipboard has no Discord incident times"
+				m.Notice = "Clipboard has no Discord safety data"
 			}
 			return m, nil
 		}
-		merged := maps.Clone(m.Session.Filter.IncidentSeconds)
-		if merged == nil {
-			merged = map[int64]int64{}
-		}
-		maps.Copy(merged, v.Seconds)
-		added := len(merged) - len(m.Session.Filter.IncidentSeconds)
-		m.Session.Filter.IncidentSeconds = merged
-		m.Session.Filter.Dates = nil
-		m.Session.Filter.From = ""
-		m.Session.Filter.Until = ""
-		m.Session.Filter.DateBefore = 0
-		m.Session.Filter.DateAfter = 0
 		m.Input.SetValue("")
-		m.DayInput.SetValue("")
-		m.Notice = fmt.Sprintf("Added %d incident times, %d total", added, len(merged))
-		if added == 0 {
-			m.Notice = fmt.Sprintf("No new incident times, %d total", len(merged))
+		return m, m.addSafety(v.Report)
+	case safetyRowsMsg:
+		if v.Revision != m.SafetyRowsRevision {
+			return m, nil
 		}
-		return m, m.changed()
+		m.SafetyRowsLoading = false
+		if v.Err != nil {
+			m.Notice = v.Err.Error()
+		} else {
+			m.SafetyMatches = v.Matches
+		}
+		if m.SafetyDirty {
+			m.SafetyDirty = false
+			return m, m.refreshSafety()
+		}
+		return m, nil
 	case dropCheckMsg:
 		if v.Revision != m.DropRevision {
 			return m, nil
@@ -121,7 +134,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.changed()
 	case tickMsg:
-		active := m.workLabel() != ""
+		active := m.workLabel() != "" || m.animating(time.Now())
 		if active {
 			m.Frame++
 		}
@@ -174,9 +187,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key := snapshotKey(v.Snapshots); key != m.SnapshotKey {
 			m.SnapshotKey = key
 			m.StatsRevision++
+			cmds := []tea.Cmd{m.refreshSafety()}
 			if m.Tab == tabStats {
-				return m, m.ensureStats()
+				cmds = append(cmds, m.ensureStats())
 			}
+			return m, tea.Batch(cmds...)
 		}
 		return m, nil
 	case statsRowsMsg:
@@ -212,6 +227,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.DayInput.SetValue("")
 			m.ChannelLabel = ""
 		}
+		var safetyCmd tea.Cmd
+		if m.LastCommand == "violations" {
+			m.safetyChanged()
+			safetyCmd = m.refreshSafety()
+		}
 		m.ConsoleFollow = m.LastCommand != "help"
 		if !m.ConsoleFollow {
 			m.Viewport.GotoTop()
@@ -239,7 +259,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Transcript = m.Transcript[len(m.Transcript)-100:]
 		}
 		m.Offset = 0
-		return m, m.refresh()
+		return m, tea.Batch(m.refresh(), safetyCmd)
 	case components.DirectoryMsg:
 		if m.Picker != nil {
 			return m, m.Picker.Apply(v)
@@ -349,6 +369,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Viewport, cmd = m.Viewport.Update(msg)
 				return m, cmd
 			}
+			if m.Tab == tabViolations {
+				if m.guideVisible() || m.Zones.Get("safety-detail").InBounds(v) {
+					var cmd tea.Cmd
+					m.Viewport, cmd = m.Viewport.Update(msg)
+					return m, cmd
+				}
+				m.safetyScroll(delta)
+				return m, nil
+			}
 			if m.Tab == tabInvestigate && !m.ServerDialog {
 				return m, m.queueScroll(delta)
 			}
@@ -379,15 +408,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
-		if v.Paste && m.Tab == tabInvestigate && likelyIncidentPaste(v.Runes) && !m.Executing && m.Picker == nil && m.Calendar == nil && !m.RequestDialog && !m.MarginDialog {
+		if v.Paste && (m.Tab == tabInvestigate || m.Tab == tabViolations) && !m.Executing && m.Picker == nil && m.Calendar == nil && !m.RequestDialog && !m.MarginDialog && safety.Likely(string(v.Runes)) {
 			m.IncidentInputRevision++
 			revision := m.IncidentInputRevision
-			runes := v.Runes
-			m.IncidentProcessing = "Reading pasted incident times…"
+			text := string(v.Runes)
+			m.IncidentProcessing = "Reading pasted safety data…"
 			m.Notice = ""
 			return m, func() tea.Msg {
-				seconds, recognized, err := importer.IncidentSecondsJSON([]byte(string(runes)))
-				return incidentInputMsg{Seconds: seconds, Recognized: recognized, Err: err, Revision: revision}
+				report, recognized, err := safety.Parse([]byte(text))
+				return incidentInputMsg{Report: report, Recognized: recognized, Err: err, Revision: revision}
 			}
 		}
 		key := v.String()
@@ -452,6 +481,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.Picker = nil
 			m.Calendar = nil
+			if m.Detail == nil && m.Tab == tabViolations {
+				m.SafetyDetail = false
+				m.SafetyGuide = false
+			}
 			m.Detail = nil
 			m.ServerDialog = false
 			m.RequestDialog = false
@@ -571,6 +604,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.Tab == tabStats {
 				return m, m.ensureStats()
 			}
+			if m.Tab == tabViolations {
+				return m, m.refreshSafety()
+			}
 			return m, nil
 		}
 		if m.Focus == "search-input" {
@@ -632,6 +668,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.Focus != "command" {
 			if m.Tab == tabStats && !m.ServerDialog && m.statsKey(key) {
+				return m, nil
+			}
+			if m.Tab == tabViolations && m.safetyKey(key) {
 				return m, nil
 			}
 			if m.ServerDialog && slices.Contains([]string{"up", "down", "left", "right"}, key) {
@@ -732,13 +771,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func likelyIncidentPaste(runes []rune) bool {
-	const probeLimit = 64 << 10
-	probe := string(runes[:min(len(runes), probeLimit)])
-	trimmed := strings.TrimLeft(probe, " \t\r\n")
-	return strings.HasPrefix(trimmed, "[") && (strings.Contains(probe, `"incident_time"`) || strings.Contains(probe, `"safety_policy_notice"`))
-}
-
 func (m *Model) action(id string) tea.Cmd {
 	if !m.enabled(id) {
 		return nil
@@ -784,6 +816,7 @@ func (m *Model) action(id string) tea.Cmd {
 		case "cal-apply":
 			m.Session.Filter.Dates = slices.Clone(m.Calendar.Dates)
 			m.Session.Filter.IncidentSeconds = nil
+			m.Session.Filter.IncidentIDs = nil
 			m.Session.Filter.From = ""
 			m.Session.Filter.Until = ""
 			m.Calendar = nil
@@ -826,6 +859,9 @@ func (m *Model) action(id string) tea.Cmd {
 	if cmd, ok := m.statsAction(id); ok {
 		return cmd
 	}
+	if cmd, ok := m.safetyAction(id); ok {
+		return cmd
+	}
 	var n int
 	if _, e := fmt.Sscanf(id, "row-server-%d", &n); e == nil && n >= 0 && n < len(m.Rows) {
 		if m.Rows[n].Guild == "" {
@@ -854,6 +890,9 @@ func (m *Model) action(id string) tea.Cmd {
 		m.Viewport.GotoTop()
 		if n == tabStats {
 			return m.ensureStats()
+		}
+		if n == tabViolations {
+			return m.refreshSafety()
 		}
 		return nil
 	}
@@ -895,21 +934,6 @@ func (m *Model) action(id string) tea.Cmd {
 	case "dates", "dates-more":
 		c := components.NewCalendar(m.Session.Today, m.Session.Filter.Dates)
 		m.Calendar = &c
-	case "clipboard":
-		m.IncidentInputRevision++
-		revision := m.IncidentInputRevision
-		m.IncidentProcessing = "Reading clipboard…"
-		m.Notice = ""
-		return func() tea.Msg {
-			ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
-			defer cancel()
-			text, err := clipboard.Read(ctx)
-			if err != nil {
-				return incidentInputMsg{Clipboard: true, Err: fmt.Errorf("read clipboard: %w. Type unix times in the date box instead", err), Revision: revision}
-			}
-			seconds, recognized, err := importer.IncidentSecondsJSON([]byte(text))
-			return incidentInputMsg{Seconds: seconds, Recognized: recognized, Clipboard: true, Err: err, Revision: revision}
-		}
 	case "clear":
 		m.DayInput.SetValue("")
 		m.SearchInput.SetValue("")
@@ -1060,6 +1084,7 @@ func (m *Model) action(id string) tea.Cmd {
 		} else {
 			m.Session.Filter.Dates = slices.Compact(slices.Sorted(slices.Values(append(m.Session.Filter.Dates, dates...))))
 			m.Session.Filter.IncidentSeconds = nil
+			m.Session.Filter.IncidentIDs = nil
 		}
 		m.DayInput.SetValue("")
 		m.Session.Filter.From = ""
@@ -1072,6 +1097,7 @@ func (m *Model) action(id string) tea.Cmd {
 		m.DayInput.SetValue("")
 		m.Session.Filter.Dates = nil
 		m.Session.Filter.IncidentSeconds = nil
+		m.Session.Filter.IncidentIDs = nil
 		m.Session.Filter.From = ""
 		m.Session.Filter.Until = ""
 		return m.changed()
@@ -1214,6 +1240,8 @@ func (m *Model) defaultFocus() string {
 		return "log-follow"
 	case tabStats:
 		return "stats-view-" + m.StatsView
+	case tabViolations:
+		return "safety-paste"
 	default:
 		return "days-input"
 	}

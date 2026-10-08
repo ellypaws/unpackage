@@ -157,6 +157,7 @@ type Filter struct {
 	Guilds, ExcludedGuilds, Dates      []string
 	ChannelTypes, ExcludedChannelTypes []string
 	IncidentSeconds                    map[int64]int64
+	IncidentIDs                        []string
 	From, Until                        string
 	Limit, Offset                      int
 	DateBefore, DateAfter              int
@@ -1450,6 +1451,14 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		incidentSeconds[second] = true
 		incidentDays[time.Unix(second, 0).In(time.Local).Format(time.DateOnly)] = true
 	}
+	incidentIDs := make(map[string]bool, len(f.IncidentIDs))
+	for _, id := range f.IncidentIDs {
+		if !digits(id) {
+			return nil, fmt.Errorf("invalid flagged message id")
+		}
+		incidentIDs[id] = true
+	}
+	incident := len(incidentSeconds) > 0 || len(incidentIDs) > 0
 	s.mu.RLock()
 	a, b := s.snapshots[0], s.snapshots[1]
 	ok, why := compatible(a, b)
@@ -1469,7 +1478,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 		}
 	}
 	mode := f.Mode
-	incidentAuto := (mode == "" || mode == "auto") && len(incidentSeconds) > 0 && ok
+	incidentAuto := (mode == "" || mode == "auto") && incident && ok
 	if mode == "" || mode == "auto" {
 		mode = "all"
 		if ok && !incidentAuto {
@@ -1512,7 +1521,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 	if f.Channel != "" {
 		capacity = len(s.byChannel[0][f.Channel]) + len(s.byChannel[1][f.Channel])
 	}
-	if len(f.Dates) > 0 || len(f.IncidentSeconds) > 0 || f.From != "" || f.Until != "" || len(f.Guilds) > 0 || slices.ContainsFunc(query.Tokens, func(t SearchToken) bool {
+	if len(f.Dates) > 0 || incident || f.From != "" || f.Until != "" || len(f.Guilds) > 0 || slices.ContainsFunc(query.Tokens, func(t SearchToken) bool {
 		return slices.Contains([]string{"server", "in", "from", "type", "id"}, t.Key)
 	}) {
 		capacity = min(capacity, 4096)
@@ -1607,6 +1616,25 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				}
 			}
 		}
+		if len(incidentIDs) > 0 {
+			byTime := candidates
+			candidates = func(yield func(observedMessage) bool) {
+				for id := range incidentIDs {
+					observed, ok := s.observedMessageLocked(slot, id)
+					if ok && !yield(observed) {
+						return
+					}
+				}
+				if len(incidentSeconds) == 0 {
+					return
+				}
+				for observed := range byTime {
+					if !incidentIDs[observed.Message.ID] && !yield(observed) {
+						return
+					}
+				}
+			}
+		}
 		visited := 0
 		for observed := range candidates {
 			visited++
@@ -1617,7 +1645,7 @@ func (s *Store) Rows(ctx context.Context, f Filter) ([]Row, error) {
 				}
 			}
 			m := observed.Message
-			if len(incidentSeconds) > 0 {
+			if incident && !incidentIDs[m.ID] {
 				created, _ := time.Parse(time.RFC3339Nano, m.Date)
 				messageMatch := !created.IsZero() && incidentSeconds[created.Unix()]
 				eventMatch := !observed.Sent.Time.IsZero() && incidentSeconds[observed.Sent.Time.Unix()]

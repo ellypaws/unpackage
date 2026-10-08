@@ -82,6 +82,12 @@ func (m *Model) menuFor(id string) (options []option, current string, preview bo
 		return mediaOptions, m.Session.Filter.Media, false, true
 	case "channel-types":
 		return channelTypeOptions, "", false, true
+	case "safety-state":
+		return safetyStates, m.SafetyState, true, true
+	case "safety-scope":
+		return safetyScopes, m.SafetyScope, true, true
+	case "safety-found":
+		return safetyFound, m.SafetyFound, true, true
 	}
 	return nil, "", false, false
 }
@@ -115,6 +121,15 @@ func (m *Model) setOption(id, key string) {
 		m.Session.Filter.Mode = key
 	case "media":
 		m.Session.Filter.Media = key
+	case "safety-state":
+		m.SafetyState = key
+		m.SafetyOffset = 0
+	case "safety-scope":
+		m.SafetyScope = key
+		m.SafetyOffset = 0
+	case "safety-found":
+		m.SafetyFound = key
+		m.SafetyOffset = 0
 	}
 }
 
